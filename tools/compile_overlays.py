@@ -4967,6 +4967,15 @@ def generate_interior_fragment_static(interior: int, data: bytes,
                           f'unknown_bad, '
                           f'{len(audit["unsupported_todo_addrs"])} unsupported')
         func_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
+        # Same identity audit the DLL fragment path applies: a fragment whose
+        # guarded bytes hold a reserved branch encoding or an unhashed delay
+        # slot is data from this interior, and audit_aot_cache.py rejects it.
+        delay_errors = audit_func_id_delay_slots(func_ids, data, load_addr)
+        if delay_errors:
+            d_entry, d_pc, d_reason = delay_errors[0]
+            d_where = f' at 0x{d_pc:08X}' if d_pc is not None else ''
+            return None, (f'generated-c-audit: delay-slot-identity: func '
+                          f'0x{d_entry:08X}{d_where}: {d_reason}')
         ids_by_addr = {}
         for ev, code_crc, ranges in func_ids:
             ids_by_addr.setdefault(ev, []).append((code_crc, ranges))

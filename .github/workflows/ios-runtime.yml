@@ -1,0 +1,40 @@
+name: ios-runtime
+on:
+  workflow_dispatch:
+  push:
+    branches: [ios]
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          xcodebuild -version | head -1
+          which ninja || brew install ninja
+      - name: Cache deps (SDL3 etc.)
+        uses: actions/cache@v4
+        with:
+          path: build-ios/_deps
+          key: ios-deps-${{ hashFiles('runtime/runtime.cmake') }}
+      - name: Configure runtime for iOS (BIOS-only, OpenBIOS)
+        run: |
+          set -o pipefail
+          cmake -S runtime -B build-ios -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DPSX_RECOMP_UI=OFF -DPSX_NETPLAY=OFF -DPSX_REWIND=OFF \
+            -DPSX_ENABLE_VULKAN=OFF -DPSXRECOMP_BIOS_STEMS=OpenBIOS \
+            2>&1 | tee configure.log | grep -v -E "^-- (Looking|Performing|Check)" | tail -80
+      - name: Build (keep going, collect all errors)
+        run: |
+          cmake --build build-ios --target psx-runtime -- -k 0 > build.log 2>&1 || true
+          echo "==== FAILED TARGETS"; grep -c "^FAILED" build.log || true
+          echo "==== ERROR SUMMARY (unique)"
+          grep -E "error:|fatal error:" build.log | sed -E 's/^.*\/(runtime|recompiler)\//\1\//' | sort | uniq -c | sort -rn | head -150
+          echo "==== FILES WITH ERRORS"
+          grep -E "error:" build.log | sed -E 's/:[0-9]+:[0-9]+: .*//' | sed -E 's/^.*\/(runtime|recompiler)\//\1\//' | sort | uniq -c | sort -rn | head -60
+          echo "==== TAIL"; tail -15 build.log
+          ls -la build-ios/*.app 2>/dev/null || true
