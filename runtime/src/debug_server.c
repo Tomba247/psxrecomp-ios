@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #endif
 #include <time.h>
+#include "host_touch_ui.h"
 #include "debug_server.h"
 #include "debug_bulk_write.h"
 #include "host_launch_timing.h"
@@ -8453,6 +8454,16 @@ static uint8_t s_host_lt = 0, s_host_rt = 0;
 static uint8_t clamp_u8_arg(int v, uint8_t dflt) {
     if (v < 0) return dflt;
     return (uint8_t)(v > 255 ? 255 : v);
+}
+
+/* touch {"finger":0,"phase":0|1|2,"x":0..1000,"y":0..1000}: a finger on the
+ * touch UI (host_touch_ui.h), in thousandths of the window. */
+static void handle_touch(int id, const char *json)
+{
+    touch_ui_inject(json_get_int(json, "finger", 0), json_get_int(json, "phase", 0),
+                    (float)json_get_int(json, "x", 0) / 1000.0f,
+                    (float)json_get_int(json, "y", 0) / 1000.0f);
+    send_ok(id);
 }
 
 static void handle_set_input(int id, const char *json)
@@ -17057,6 +17068,7 @@ static const CmdEntry s_commands[] = {
     { "fmv_state",         handle_fmv_state },
     { "mdec_trace_clear",  handle_mdec_trace_clear },
     { "set_input",         handle_set_input },
+    { "touch",             handle_touch },
     { "press",             handle_press },
     { "pad_status",        handle_pad_status },
     { "rewind_status",     handle_rewind_status },

@@ -24,6 +24,7 @@
 #include "video_telemetry.h"
 #include "gpu_sw_renderer.h"
 #include "host_osd.h"
+#include "host_touch_ui.h"
 #include "psx_savestate_menu.h"
 #include "psx_host_menu.h"
 #include "psx_rewind.h"
@@ -1663,10 +1664,15 @@ static void vk_osd_blit(VkCommandBuffer cb, VkImage sc) {
 }
 
 static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr);
+static void ov_draw(VkCommandBuffer cb, uint32_t idx);
+static void ov_release_swapchain(void);
+static void ov_destroy_all(void);
 
 static void finish_present(VkCommandBuffer cb, VkImage sc,
                            uint32_t img_idx, uint32_t fr) {
     vk_osd_blit(cb, sc);
+    ov_draw(cb, img_idx);
+    touch_ui_presented();
     img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_ACCESS_TRANSFER_WRITE_BIT, 0,
@@ -1705,6 +1711,11 @@ static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr) {
 
 /* Compute a letterbox rect for the swapchain given a source aspect. */
 static void letterbox(int sw, int sh, int aw, int ah, VkOffset3D off[2]) {
+    if (touch_ui_fit_screen()) {   /* settings: stretch over the whole screen */
+        off[0].x = 0;  off[0].y = 0;  off[0].z = 0;
+        off[1].x = sw; off[1].y = sh; off[1].z = 1;
+        return;
+    }
     /* center-fit aw:ah inside sw x sh */
     int tw = sw, th = sw * ah / aw;
     if (th > sh) { th = sh; tw = sh * aw / ah; }
@@ -1746,10 +1757,12 @@ static void pp_release_swapchain(void) {
     }
     if (s_pp_pipe) { p_vkDestroyPipeline(s_dev, s_pp_pipe, NULL); s_pp_pipe = VK_NULL_HANDLE; }
     if (s_pp_rp)   { p_vkDestroyRenderPass(s_dev, s_pp_rp, NULL); s_pp_rp = VK_NULL_HANDLE; }
+    ov_release_swapchain();
 }
 
 static void pp_destroy_all(void) {
     pp_release_swapchain();
+    ov_destroy_all();
     if (s_pp_pool) { p_vkDestroyDescriptorPool(s_dev, s_pp_pool, NULL); s_pp_pool = VK_NULL_HANDLE; }
     if (s_pp_pl)   { p_vkDestroyPipelineLayout(s_dev, s_pp_pl, NULL); s_pp_pl = VK_NULL_HANDLE; }
     if (s_pp_dsl)  { p_vkDestroyDescriptorSetLayout(s_dev, s_pp_dsl, NULL); s_pp_dsl = VK_NULL_HANDLE; }
@@ -1924,6 +1937,238 @@ static int pp_draw(VkCommandBuffer cb, uint32_t idx, uint32_t fr, VkImageView sr
     p_vkCmdDraw(cb, 3, 1, 0, 0);
     p_vkCmdEndRenderPass(cb);
     return 1;
+}
+
+/* ---- touch UI overlay pass ------------------------------------------------ */
+/* host_touch_ui draws the on-screen pad, settings button and settings panel
+ * into one premultiplied ARGB canvas. It is uploaded when it changes and
+ * alpha-blended over the finished swapchain image, which stays in
+ * TRANSFER_DST_OPTIMAL for finish_present's barrier. Created lazily; any
+ * failure turns the overlay off for the session. */
+static VkRenderPass          s_ov_rp;
+static VkImageView           s_ov_views[8];
+static VkFramebuffer         s_ov_fbs[8];
+static VkPipeline            s_ov_pipe;
+static VkDescriptorSetLayout s_ov_dsl;
+static VkPipelineLayout      s_ov_pl;
+static VkDescriptorPool      s_ov_pool;
+static VkDescriptorSet       s_ov_ds;
+static VkShaderModule        s_ov_vs, s_ov_fs;
+static VkSampler             s_ov_samp;
+static VkImage               s_ov_img;
+static VkDeviceMemory        s_ov_mem;
+static VkImageView           s_ov_view;
+static VkImageLayout         s_ov_layout;
+static int                   s_ov_w, s_ov_h, s_ov_failed;
+static unsigned              s_ov_version;
+static VkBuffer              s_ov_buf;
+static VkDeviceMemory        s_ov_bmem;
+static void                 *s_ov_map;
+
+static void ov_release_swapchain(void) {
+    for (int i = 0; i < 8; i++) {
+        if (s_ov_fbs[i])   { p_vkDestroyFramebuffer(s_dev, s_ov_fbs[i], NULL); s_ov_fbs[i] = VK_NULL_HANDLE; }
+        if (s_ov_views[i]) { p_vkDestroyImageView(s_dev, s_ov_views[i], NULL); s_ov_views[i] = VK_NULL_HANDLE; }
+    }
+    if (s_ov_pipe) { p_vkDestroyPipeline(s_dev, s_ov_pipe, NULL); s_ov_pipe = VK_NULL_HANDLE; }
+    if (s_ov_rp)   { p_vkDestroyRenderPass(s_dev, s_ov_rp, NULL); s_ov_rp = VK_NULL_HANDLE; }
+}
+
+static void ov_release_image(void) {
+    if (s_ov_view) { p_vkDestroyImageView(s_dev, s_ov_view, NULL); s_ov_view = VK_NULL_HANDLE; }
+    if (s_ov_img)  { p_vkDestroyImage(s_dev, s_ov_img, NULL); s_ov_img = VK_NULL_HANDLE; }
+    if (s_ov_mem)  { p_vkFreeMemory(s_dev, s_ov_mem, NULL); s_ov_mem = VK_NULL_HANDLE; }
+    if (s_ov_buf)  { staging_destroy(s_ov_buf, s_ov_bmem); s_ov_buf = VK_NULL_HANDLE; s_ov_bmem = VK_NULL_HANDLE; }
+    s_ov_map = NULL; s_ov_w = s_ov_h = 0; s_ov_version = 0;
+    s_ov_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+static void ov_destroy_all(void) {
+    ov_release_swapchain();
+    ov_release_image();
+    if (s_ov_pool) { p_vkDestroyDescriptorPool(s_dev, s_ov_pool, NULL); s_ov_pool = VK_NULL_HANDLE; }
+    if (s_ov_pl)   { p_vkDestroyPipelineLayout(s_dev, s_ov_pl, NULL); s_ov_pl = VK_NULL_HANDLE; }
+    if (s_ov_dsl)  { p_vkDestroyDescriptorSetLayout(s_dev, s_ov_dsl, NULL); s_ov_dsl = VK_NULL_HANDLE; }
+    if (s_ov_vs)   { p_vkDestroyShaderModule(s_dev, s_ov_vs, NULL); s_ov_vs = VK_NULL_HANDLE; }
+    if (s_ov_fs)   { p_vkDestroyShaderModule(s_dev, s_ov_fs, NULL); s_ov_fs = VK_NULL_HANDLE; }
+    if (s_ov_samp) { p_vkDestroySampler(s_dev, s_ov_samp, NULL); s_ov_samp = VK_NULL_HANDLE; }
+    s_ov_ds = VK_NULL_HANDLE;
+    s_ov_failed = 0;
+}
+
+static int ov_init_device_objects(void) {
+    if (s_ov_pl) return 1;
+    s_ov_vs = make_module(spv_present_vert, spv_present_vert_size);
+    s_ov_fs = make_module(spv_overlay_frag, spv_overlay_frag_size);
+    if (!s_ov_vs || !s_ov_fs) return 0;
+    VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    if (p_vkCreateSampler(s_dev, &sci, NULL, &s_ov_samp) != VK_SUCCESS) return 0;
+    VkDescriptorSetLayoutBinding b = {0};
+    b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dci.bindingCount = 1; dci.pBindings = &b;
+    if (p_vkCreateDescriptorSetLayout(s_dev, &dci, NULL, &s_ov_dsl) != VK_SUCCESS) return 0;
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+    VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
+    if (p_vkCreateDescriptorPool(s_dev, &pci, NULL, &s_ov_pool) != VK_SUCCESS) return 0;
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    ai.descriptorPool = s_ov_pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &s_ov_dsl;
+    if (p_vkAllocateDescriptorSets(s_dev, &ai, &s_ov_ds) != VK_SUCCESS) return 0;
+    VkPipelineLayoutCreateInfo li = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    li.setLayoutCount = 1; li.pSetLayouts = &s_ov_dsl;
+    return p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_ov_pl) == VK_SUCCESS;
+}
+
+static int ov_init_swapchain_objects(void) {
+    if (s_ov_pipe) return 1;
+    VkAttachmentDescription att = {0};
+    att.format = s_sc_format; att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;           /* keep the game picture */
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub = {0};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1; sub.pColorAttachments = &cref;
+    VkSubpassDependency dep[2] = {0};
+    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL; dep[0].dstSubpass = 0;
+    dep[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep[1].srcSubpass = 0; dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dep[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    VkRenderPassCreateInfo rpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    rpi.attachmentCount = 1; rpi.pAttachments = &att;
+    rpi.subpassCount = 1; rpi.pSubpasses = &sub;
+    rpi.dependencyCount = 2; rpi.pDependencies = dep;
+    if (p_vkCreateRenderPass(s_dev, &rpi, NULL, &s_ov_rp) != VK_SUCCESS) return 0;
+
+    VkPipelineShaderStageCreateInfo st[2] = {
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO } };
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = s_ov_vs; st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = s_ov_fs; st[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba = {0};
+    ba.blendEnable = VK_TRUE;
+    ba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.colorBlendOp = VK_BLEND_OP_ADD;
+    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.alphaBlendOp = VK_BLEND_OP_ADD;
+    ba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cbs.attachmentCount = 1; cbs.pAttachments = &ba;
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    ci.stageCount = 2; ci.pStages = st;
+    ci.pVertexInputState = &vin; ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vp; ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &ms; ci.pColorBlendState = &cbs; ci.pDynamicState = &dy;
+    ci.layout = s_ov_pl; ci.renderPass = s_ov_rp;
+    return p_vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &ci, NULL, &s_ov_pipe) == VK_SUCCESS;
+}
+
+static VkFramebuffer ov_framebuffer(uint32_t idx) {
+    if (idx >= 8 || idx >= s_sc_count) return VK_NULL_HANDLE;
+    if (s_ov_fbs[idx]) return s_ov_fbs[idx];
+    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vi.image = s_sc_images[idx]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = s_sc_format;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+    if (p_vkCreateImageView(s_dev, &vi, NULL, &s_ov_views[idx]) != VK_SUCCESS) {
+        s_ov_views[idx] = VK_NULL_HANDLE; return VK_NULL_HANDLE;
+    }
+    VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+    fi.renderPass = s_ov_rp; fi.attachmentCount = 1; fi.pAttachments = &s_ov_views[idx];
+    fi.width = s_sc_extent.width; fi.height = s_sc_extent.height; fi.layers = 1;
+    if (p_vkCreateFramebuffer(s_dev, &fi, NULL, &s_ov_fbs[idx]) != VK_SUCCESS)
+        s_ov_fbs[idx] = VK_NULL_HANDLE;
+    return s_ov_fbs[idx];
+}
+
+/* Blend the touch UI over swapchain image idx (in TRANSFER_DST_OPTIMAL). */
+static void ov_draw(VkCommandBuffer cb, uint32_t idx) {
+    const uint32_t *px; int w, h; unsigned ver;
+    if (s_ov_failed) return;
+    if (!touch_ui_canvas((int)s_sc_extent.width, (int)s_sc_extent.height, &px, &w, &h, &ver)) return;
+    if (!ov_init_device_objects() || !ov_init_swapchain_objects()) {
+        s_ov_failed = 1;
+        fprintf(stdout, "psxrecomp: vulkan: touch overlay pass unavailable\n");
+        return;
+    }
+    if (w != s_ov_w || h != s_ov_h || !s_ov_img) {
+        p_vkDeviceWaitIdle(s_dev);
+        ov_release_image();
+        if (!make_image(VK_FORMAT_B8G8R8A8_UNORM, w, h,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &s_ov_img, &s_ov_mem, &s_ov_view) ||
+            !make_staging((VkDeviceSize)w * (VkDeviceSize)h * 4u, &s_ov_buf, &s_ov_bmem, &s_ov_map)) {
+            s_ov_failed = 1;
+            fprintf(stdout, "psxrecomp: vulkan: touch overlay image unavailable\n");
+            return;
+        }
+        s_ov_w = w; s_ov_h = h;
+        VkDescriptorImageInfo ii = { s_ov_samp, s_ov_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        wr.dstSet = s_ov_ds; wr.dstBinding = 0; wr.descriptorCount = 1;
+        wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr.pImageInfo = &ii;
+        p_vkUpdateDescriptorSets(s_dev, 1, &wr, 0, NULL);
+    }
+    if (ver != s_ov_version || s_ov_layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        memcpy(s_ov_map, px, (size_t)w * (size_t)h * 4u);
+        img_barrier(cb, s_ov_img, s_ov_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy bc = {0};
+        bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bc.imageSubresource.layerCount = 1;
+        bc.imageExtent.width = (uint32_t)w; bc.imageExtent.height = (uint32_t)h; bc.imageExtent.depth = 1;
+        p_vkCmdCopyBufferToImage(cb, s_ov_buf, s_ov_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+        img_barrier(cb, s_ov_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        s_ov_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        s_ov_version = ver;
+    }
+    VkFramebuffer fb = ov_framebuffer(idx);
+    if (!fb) return;
+    VkRenderPassBeginInfo bi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    bi.renderPass = s_ov_rp; bi.framebuffer = fb;
+    bi.renderArea.extent = s_sc_extent;
+    p_vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport view = { 0.0f, 0.0f, (float)s_sc_extent.width, (float)s_sc_extent.height, 0.0f, 1.0f };
+    VkRect2D sci = { { 0, 0 }, s_sc_extent };
+    p_vkCmdSetViewport(cb, 0, 1, &view);
+    p_vkCmdSetScissor(cb, 0, 1, &sci);
+    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_ov_pipe);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_ov_pl, 0, 1, &s_ov_ds, 0, NULL);
+    p_vkCmdDraw(cb, 3, 1, 0, 0);
+    p_vkCmdEndRenderPass(cb);
 }
 
 int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,

@@ -224,6 +224,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
  */
 #include <SDL3/SDL_main.h>
 #include "psx_ios_boot.h"
+#include "host_touch_ui.h"
 #endif
 #include "psx_sdl_audio.h"
 #if defined(PSX_WEB)
@@ -7006,6 +7007,12 @@ extern "C" int psx_mod_read_local_pad_sticks(uint32_t player,
 /* Debug host-pad layer (set_input {"layer":"host"}): a virtual P1 gamepad. */
 static int host_pad_layer(uint16_t* buttons, uint8_t st[4], uint8_t* lt,
                           uint8_t* rt) {
+    /* On-screen touch pad (host_touch_ui.h): a virtual P1 gamepad too. */
+    if (touch_ui_get_pad(buttons, st)) {
+        if (lt) *lt = 0;
+        if (rt) *rt = 0;
+        return 1;
+    }
 #ifndef PSX_NO_DEBUG_TOOLS
     return debug_server_get_host_pad(buttons, st, lt, rt);
 #else

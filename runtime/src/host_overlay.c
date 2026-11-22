@@ -1,4 +1,5 @@
 /* host_overlay.c -- see host_overlay.h. */
+#include "host_touch_ui.h"
 #include "host_overlay.h"
 
 #include <stdatomic.h>
@@ -158,6 +159,8 @@ void psx_host_set_input_sink(PsxHostInputSinkFn fn, void *ctx) {
 }
 
 int psx_host_input_sink_dispatch(const void *event) {
+    /* Touch pad / settings button first (inert unless the touch UI is on). */
+    if (event && touch_ui_event(event)) return 1;
     return (s_sink_fn && event) ? (s_sink_fn(event, s_sink_ctx) != 0) : 0;
 }
 
