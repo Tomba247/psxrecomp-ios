@@ -10,6 +10,7 @@
  */
 #include "psx_ios_boot.h"
 #ifdef PSX_IOS
+#include "psx_sdl.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -88,6 +90,10 @@ extern "C" void psx_ios_prepare(int *argc, char ***argv) {
     setenv("SDL_JOYSTICK_HIDAPI_STEAM", "0", 0);
     setenv("SDL_JOYSTICK_HIDAPI_STEAM_HORI", "0", 0);
 
+    /* Caches (seamless-loading resources, resident packs) default to
+     * $HOME/.cache, which the sandbox does not allow. */
+    setenv("XDG_CACHE_HOME", (fs::path(home ? home : ".") / "Library" / "Caches").c_str(), 0);
+
     /* SDL loads Vulkan by name; point it at the MoltenVK the app carries. */
     const fs::path mvk = bundle / "Frameworks" / "MoltenVK.framework" / "MoltenVK";
     if (fs::exists(mvk, ec)) setenv("SDL_VULKAN_LIBRARY", mvk.c_str(), 0);
@@ -145,5 +151,27 @@ extern "C" void psx_ios_prepare(int *argc, char ***argv) {
                 bundle.c_str(), docs.c_str());
     for (int i = 1; i < *argc; ++i) std::printf(" [%s]", (*argv)[i]);
     std::printf("\n");
+}
+
+static std::atomic<int> g_ios_inactive{0};
+static std::atomic<int> g_ios_watch{0};
+
+static bool SDLCALL psx_ios_lifecycle_watch(void *, SDL_Event *e) {
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND || e->type == SDL_EVENT_DID_ENTER_BACKGROUND)
+        g_ios_inactive.store(1);
+    else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND)
+        g_ios_inactive.store(0);
+    return true;
+}
+
+extern "C" void psx_ios_wait_foreground(void) {
+    if (!g_ios_watch.exchange(1)) SDL_AddEventWatch(psx_ios_lifecycle_watch, nullptr);
+    if (!g_ios_inactive.load()) return;
+    std::printf("psxrecomp-ios: app inactive, holding GPU work\n");
+    while (g_ios_inactive.load()) {
+        if (SDL_IsMainThread()) SDL_PumpEvents();
+        SDL_Delay(30);
+    }
+    std::printf("psxrecomp-ios: app active again\n");
 }
 #endif

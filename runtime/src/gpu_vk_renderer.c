@@ -20,6 +20,7 @@
 #include "gpu.h"
 #include "gpu_render.h"
 #include "gpu_vk_renderer.h"
+#include "psx_ios_boot.h"
 #include "video_telemetry.h"
 #include "gpu_sw_renderer.h"
 #include "host_osd.h"
@@ -1517,6 +1518,9 @@ void vk_renderer_set_present_mode(int mode) { s_present_mode_req = mode; }
  * blank (the image is cleared to black). Returns 1 on success. */
 static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
                            uint32_t *out_idx, uint32_t *out_frame) {
+#ifdef PSX_IOS
+    psx_ios_wait_foreground();
+#endif
     uint32_t fr = s_frame_idx % VK_FRAMES;
     p_vkWaitForFences(s_dev, 1, &s_fence[fr], VK_TRUE, UINT64_MAX);
     uint32_t img_idx = 0;
