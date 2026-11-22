@@ -22634,6 +22634,11 @@ session_reboot:
             win_flags |= PSX_SDL_WINDOW_HIGH_DENSITY;
     }
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
+#ifdef PSX_IOS
+    /* A phone screen is 3x: without a high-density drawable the swapchain is
+     * created at point size (956x440 on a 2868x1320 panel) and scaled up. */
+    win_flags |= PSX_SDL_WINDOW_HIGH_DENSITY;
+#endif
     if (g_hidden_window) {
         win_flags &= ~(Uint32)SDL_WINDOW_SHOWN;
         win_flags |= SDL_WINDOW_HIDDEN;
