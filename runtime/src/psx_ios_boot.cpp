@@ -18,6 +18,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -38,8 +39,19 @@ extern "C" void psx_ios_prepare(int *argc, char ***argv) {
 
     const fs::path log = docs / "psxrecomp.log";
     fs::rename(log, docs / "psxrecomp.prev.log", ec);
-    if (std::freopen(log.c_str(), "w", stdout)) std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    if (std::freopen(log.c_str(), "a", stderr)) std::setvbuf(stderr, nullptr, _IONBF, 0);
+    /* One descriptor, append mode, shared by stdout and stderr (and by NSLog,
+     * which writes to fd 2), so lines interleave in order instead of
+     * overwriting each other. */
+    {
+        int fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+        if (fd >= 0) {
+            std::fflush(stdout); std::fflush(stderr);
+            dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) close(fd);
+            std::setvbuf(stdout, nullptr, _IOLBF, 0);
+            std::setvbuf(stderr, nullptr, _IONBF, 0);
+        }
+    }
 
     const std::string real_argv0 = (*argc > 0 && (*argv)[0]) ? (*argv)[0] : "psx-runtime";
     const fs::path bundle = fs::path(real_argv0).parent_path();
