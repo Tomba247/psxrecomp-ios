@@ -56,8 +56,7 @@ extern "C" void psx_ios_prepare(int *argc, char ***argv) {
         std::error_code e;
         if (fs::is_symlink(link, e)) fs::remove(link, e);
         if (!fs::exists(link, e)) fs::create_symlink(target, link, e);
-        if (e) std::fprintf(stderr, "psxrecomp-ios: link %s: %s
-", link.c_str(), e.message().c_str());
+        if (e) std::fprintf(stderr, "psxrecomp-ios: link %s: %s\n", link.c_str(), e.message().c_str());
     };
     for (fs::directory_iterator it(bundle, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string name = it->path().filename().string();
