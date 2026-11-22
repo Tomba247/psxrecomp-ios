@@ -15,6 +15,10 @@
 #elif !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
+#include "psx_ios.h"
+#ifdef PSX_IOS
+#include <sys/stat.h>
+#endif
 #include <time.h>
 #include "debug_server.h"
 #include "debug_bulk_write.h"
@@ -15822,6 +15826,8 @@ static void handle_overlay_dump(int id, const char *json)
     /* Create output directory (best-effort). */
 #ifdef _WIN32
     { char cmd[600]; snprintf(cmd, sizeof(cmd), "mkdir \"%s\" 2>nul", dir_buf); system(cmd); }
+#elif defined(PSX_IOS)
+    mkdir(dir_buf, 0755);   /* no system() on iOS */
 #else
     { char cmd[600]; snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", dir_buf); system(cmd); }
 #endif

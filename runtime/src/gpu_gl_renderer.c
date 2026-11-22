@@ -105,7 +105,12 @@
 #include "host_deadline.h"
 
 #include "psx_sdl.h"
-#if defined(PSX_SDL3)
+#include "psx_ios.h"
+#if defined(PSX_IOS)
+#include <OpenGLES/ES3/gl.h>
+#include <OpenGLES/ES3/glext.h>
+#include "gl_es_compat.h"
+#elif defined(PSX_SDL3)
 #include <SDL3/SDL_opengl.h>
 #else
 #include <SDL_opengl.h>
