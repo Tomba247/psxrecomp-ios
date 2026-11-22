@@ -223,6 +223,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
  * every SDL-using source emit WinMain under MinGW.
  */
 #include <SDL3/SDL_main.h>
+#include "psx_ios_boot.h"
 #endif
 #include "psx_sdl_audio.h"
 #if defined(PSX_WEB)
@@ -18790,6 +18791,9 @@ static const PsxRuntimeMenuHost kRuntimeMenuHost = {
 };
 
 int main(int argc, char** argv) {
+#ifdef PSX_IOS
+    psx_ios_prepare(&argc, &argv);
+#endif
     psx_disc_warning_set("");
     g_main_argc = argc;
     g_main_argv = argv;

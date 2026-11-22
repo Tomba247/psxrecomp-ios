@@ -409,6 +409,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/render_thread.c
     ${PSXRECOMP_ROOT}/runtime/src/present_thread.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_ios_boot.cpp
     ${PSXRECOMP_ROOT}/runtime/src/gpu_fmv_hd.c
     ${PSXRECOMP_ROOT}/runtime/src/gl_batch_policy_lle.c
     ${PSXRECOMP_ROOT}/runtime/src/gl_batch_policy_hle.c

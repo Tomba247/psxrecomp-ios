@@ -1,0 +1,105 @@
+/* psx_ios_boot.cpp — iOS start-up shim (see psx_ios_boot.h).
+ *
+ * Layout on the device:
+ *   <App>.app/                 read-only: executable, bios/, game.toml, Frameworks/
+ *   <container>/Documents/     the user's folder in the Files app (writable):
+ *       *.cue + *.bin          the user's own disc image
+ *       saves/                 memory cards, save states, options
+ *       args.txt               optional: one extra argument per line
+ *       psxrecomp.log          this run's log (previous run: psxrecomp.prev.log)
+ */
+#include "psx_ios_boot.h"
+#ifdef PSX_IOS
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <unistd.h>
+
+namespace fs = std::filesystem;
+
+static std::vector<std::string> g_args;
+static std::vector<char *> g_argv;
+
+static bool has_flag(const std::vector<std::string> &a, const char *flag) {
+    return std::find(a.begin(), a.end(), flag) != a.end();
+}
+
+extern "C" void psx_ios_prepare(int *argc, char ***argv) {
+    std::error_code ec;
+    const char *home = std::getenv("HOME");
+    const fs::path docs = fs::path(home ? home : ".") / "Documents";
+    fs::create_directories(docs / "saves", ec);
+    if (chdir(docs.c_str()) != 0) std::perror("psxrecomp-ios: chdir(Documents)");
+
+    const fs::path log = docs / "psxrecomp.log";
+    fs::rename(log, docs / "psxrecomp.prev.log", ec);
+    if (std::freopen(log.c_str(), "w", stdout)) std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    if (std::freopen(log.c_str(), "a", stderr)) std::setvbuf(stderr, nullptr, _IONBF, 0);
+
+    const std::string argv0 = (*argc > 0 && (*argv)[0]) ? (*argv)[0] : "psx-runtime";
+    const fs::path bundle = fs::path(argv0).parent_path();
+
+    /* SDL loads Vulkan by name; point it at the MoltenVK the app carries. */
+    const fs::path mvk = bundle / "Frameworks" / "MoltenVK.framework" / "MoltenVK";
+    if (fs::exists(mvk, ec)) setenv("SDL_VULKAN_LIBRARY", mvk.c_str(), 0);
+
+    std::vector<std::string> extra;
+    {
+        std::ifstream in(docs / "args.txt");
+        for (std::string line; std::getline(in, line);) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty() && line[0] != '#') extra.push_back(line);
+        }
+    }
+
+    g_args.clear();
+    g_args.push_back(argv0);
+    g_args.push_back("--no-launcher");
+    if (!has_flag(extra, "--game") && fs::exists(bundle / "game.toml", ec)) {
+        g_args.push_back("--game");
+        g_args.push_back((bundle / "game.toml").string());
+    }
+    if (!has_flag(extra, "--disc")) {
+        std::vector<fs::path> cues;
+        for (fs::directory_iterator it(docs, ec), end; !ec && it != end; it.increment(ec)) {
+            std::string ext = it->path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".cue" || ext == ".chd") cues.push_back(it->path());
+        }
+        std::sort(cues.begin(), cues.end());
+        if (!cues.empty()) {
+            g_args.push_back("--disc");
+            g_args.push_back(cues.front().string());
+        } else {
+            std::ofstream(docs / "PUT YOUR DISC IMAGE HERE.txt")
+                << "Copy your own disc image (.cue and its .bin files, or a .chd) into this folder,\n"
+                   "then start the app again.\n";
+        }
+    }
+    if (!has_flag(extra, "--memcard-dir")) {
+        g_args.push_back("--memcard-dir");
+        g_args.push_back((docs / "saves").string());
+    }
+    if (!has_flag(extra, "--renderer")) {
+        g_args.push_back("--renderer");
+        g_args.push_back("vulkan");
+    }
+    for (const std::string &e : extra) g_args.push_back(e);
+
+    g_argv.clear();
+    for (std::string &s : g_args) g_argv.push_back(s.data());
+    g_argv.push_back(nullptr);
+    *argc = (int)g_args.size();
+    *argv = g_argv.data();
+
+    std::printf("psxrecomp-ios: bundle=%s\npsxrecomp-ios: documents=%s\npsxrecomp-ios: args:",
+                bundle.c_str(), docs.c_str());
+    for (int i = 1; i < *argc; ++i) std::printf(" [%s]", (*argv)[i]);
+    std::printf("\n");
+}
+#endif
