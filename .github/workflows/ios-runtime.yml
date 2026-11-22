@@ -13,6 +13,24 @@ jobs:
         run: |
           xcodebuild -version | head -1
           which ninja || brew install ninja
+      - name: Vulkan headers, glslc and MoltenVK (Khronos release build)
+        run: |
+          set -euo pipefail
+          MVK_VERSION=v1.4.2
+          brew list shaderc >/dev/null 2>&1 || brew install shaderc
+          mkdir -p "$RUNNER_TEMP/mvk" "$RUNNER_TEMP/vksdk/bin"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/MoltenVK-ios.tar"             "https://github.com/KhronosGroup/MoltenVK/releases/download/$MVK_VERSION/MoltenVK-ios.tar"
+          shasum -a 256 "$RUNNER_TEMP/MoltenVK-ios.tar"
+          tar -xf "$RUNNER_TEMP/MoltenVK-ios.tar" -C "$RUNNER_TEMP/mvk"
+          INC=$(find "$RUNNER_TEMP/mvk" -type d -name vulkan -path '*include*' | head -1)
+          FW=$(find "$RUNNER_TEMP/mvk" -type d -name MoltenVK.framework -path '*dynamic*' -path '*ios-arm64/*' ! -path '*simulator*' | head -1)
+          test -n "$INC" && test -n "$FW"
+          ln -s "$(dirname "$INC")" "$RUNNER_TEMP/vksdk/include"
+          ln -s "$(which glslc)" "$RUNNER_TEMP/vksdk/bin/glslc"
+          ls "$RUNNER_TEMP/vksdk/include"
+          lipo -info "$FW/MoltenVK"
+          echo "VULKAN_SDK=$RUNNER_TEMP/vksdk" >> "$GITHUB_ENV"
+          echo "MVK_FRAMEWORK=$FW" >> "$GITHUB_ENV"
       - name: Cache deps (SDL3 etc.)
         uses: actions/cache@v4
         with:
@@ -26,8 +44,9 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
             -DPSX_RECOMP_UI=OFF -DPSX_NETPLAY=OFF -DPSX_REWIND=OFF \
-            -DPSX_ENABLE_VULKAN=OFF -DPSXRECOMP_BIOS_STEMS=OpenBIOS \
+            -DPSX_ENABLE_VULKAN=ON -DGLSLC_EXE="$VULKAN_SDK/bin/glslc" -DPSXRECOMP_BIOS_STEMS=OpenBIOS \
             2>&1 | tee configure.log | grep -v -E "^-- (Looking|Performing|Check)" | tail -80
+          grep -i "vulkan" configure.log || true
       - name: Build (keep going, collect all errors)
         run: |
           cmake --build build-ios --target psx-runtime -- -k 0 > build.log 2>&1 || true
