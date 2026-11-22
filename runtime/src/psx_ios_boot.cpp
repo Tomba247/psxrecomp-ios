@@ -41,8 +41,34 @@ extern "C" void psx_ios_prepare(int *argc, char ***argv) {
     if (std::freopen(log.c_str(), "w", stdout)) std::setvbuf(stdout, nullptr, _IOLBF, 0);
     if (std::freopen(log.c_str(), "a", stderr)) std::setvbuf(stderr, nullptr, _IONBF, 0);
 
-    const std::string argv0 = (*argc > 0 && (*argv)[0]) ? (*argv)[0] : "psx-runtime";
-    const fs::path bundle = fs::path(argv0).parent_path();
+    const std::string real_argv0 = (*argc > 0 && (*argv)[0]) ? (*argv)[0] : "psx-runtime";
+    const fs::path bundle = fs::path(real_argv0).parent_path();
+
+    /* The runtime anchors every file it reads AND writes (settings, mods/state,
+     * caches, texture packs) at the executable's folder, which on iOS is the
+     * read-only bundle. Give it Documents as that folder instead: link the
+     * bundle's read-only resources into it on every launch (the bundle path
+     * changes with each install) and report the executable as living there. */
+    static const char *const skip[] = {"Info.plist", "PkgInfo", "Frameworks", "_CodeSignature",
+                                       "embedded.mobileprovision", "SC_Info", "mods"};
+    const std::string exe_name = fs::path(real_argv0).filename().string();
+    auto relink = [&](const fs::path &target, const fs::path &link) {
+        std::error_code e;
+        if (fs::is_symlink(link, e)) fs::remove(link, e);
+        if (!fs::exists(link, e)) fs::create_symlink(target, link, e);
+        if (e) std::fprintf(stderr, "psxrecomp-ios: link %s: %s
+", link.c_str(), e.message().c_str());
+    };
+    for (fs::directory_iterator it(bundle, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name == exe_name) continue;
+        bool skipped = false;
+        for (const char *s : skip) skipped = skipped || name == s;
+        if (!skipped) relink(it->path(), docs / name);
+    }
+    fs::create_directories(docs / "mods", ec);
+    if (fs::exists(bundle / "mods" / "bundled", ec)) relink(bundle / "mods" / "bundled", docs / "mods" / "bundled");
+    const std::string argv0 = (docs / exe_name).string();
 
     /* SDL loads Vulkan by name; point it at the MoltenVK the app carries. */
     const fs::path mvk = bundle / "Frameworks" / "MoltenVK.framework" / "MoltenVK";
@@ -60,9 +86,9 @@ extern "C" void psx_ios_prepare(int *argc, char ***argv) {
     g_args.clear();
     g_args.push_back(argv0);
     g_args.push_back("--no-launcher");
-    if (!has_flag(extra, "--game") && fs::exists(bundle / "game.toml", ec)) {
+    if (!has_flag(extra, "--game") && fs::exists(docs / "game.toml", ec)) {
         g_args.push_back("--game");
-        g_args.push_back((bundle / "game.toml").string());
+        g_args.push_back((docs / "game.toml").string());
     }
     if (!has_flag(extra, "--disc")) {
         std::vector<fs::path> cues;
