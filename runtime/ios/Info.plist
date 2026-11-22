@@ -24,6 +24,7 @@
     <key>CADisableMinimumFrameDurationOnPhone</key><true/>
     <key>GCSupportsControllerUserInteraction</key><true/>
     <key>UIApplicationSupportsIndirectInputEvents</key><true/>
+    <key>NSBluetoothAlwaysUsageDescription</key><string>Used to connect Bluetooth game controllers.</string>
 __ICON_KEYS__
     <key>UISupportedInterfaceOrientations</key>
     <array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>

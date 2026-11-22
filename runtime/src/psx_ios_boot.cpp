@@ -81,6 +81,13 @@ extern "C" void psx_ios_prepare(int *argc, char ***argv) {
     if (fs::exists(bundle / "mods" / "bundled", ec)) relink(bundle / "mods" / "bundled", docs / "mods" / "bundled");
     const std::string argv0 = (docs / exe_name).string();
 
+    /* SDL's HIDAPI Steam Controller driver opens CoreBluetooth at joystick
+     * init. Standard pads arrive through the Game Controller framework, so
+     * leave that driver off (the Info.plist still declares Bluetooth use, as
+     * iOS aborts an app that touches CoreBluetooth without it). */
+    setenv("SDL_JOYSTICK_HIDAPI_STEAM", "0", 0);
+    setenv("SDL_JOYSTICK_HIDAPI_STEAM_HORI", "0", 0);
+
     /* SDL loads Vulkan by name; point it at the MoltenVK the app carries. */
     const fs::path mvk = bundle / "Frameworks" / "MoltenVK.framework" / "MoltenVK";
     if (fs::exists(mvk, ec)) setenv("SDL_VULKAN_LIBRARY", mvk.c_str(), 0);
