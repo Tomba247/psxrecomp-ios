@@ -4703,6 +4703,7 @@ typedef struct {
     uint8_t op, pc_valid, pq_valid, used, bd, ovr;   /* ovr: move by (sdx, sdy) instead of toward the pair */
     int16_t offx, offy;
     float sdx, sdy;
+    float vdx[3], vdy[3];        /* ovr 4: per-vertex motion since the previous frame */
     int32_t a[20];
     float pcx[3], pcy[3], pq[3];
     uint32_t key;
@@ -4726,6 +4727,7 @@ static int s_fg_cur;                 /* index of the list being recorded */
 static int s_fg_on = -1;
 static int s_fg_head[FG_HASH];
 static unsigned s_fg_stat_flips, s_fg_stat_made, s_fg_stat_prims, s_fg_stat_matched;
+static unsigned s_fg_stat_orph, s_fg_stat_orph_vert, s_fg_stat_orph_near;
 
 /* Vertex count and the a[] slots of each vertex's x and y, per op. */
 static const struct { int nv; int xi[3], yi[3]; } kFgPos[FG_OPS] = {
@@ -5009,6 +5011,83 @@ static void fg_regularize(const FgList *prev, FgList *cur) {
     for (int i = 0; i < cur->n; i++) cur->c[i].ovr &= 1;
 }
 
+/* Orphans. A primitive whose texture coordinates, palette or colour changed
+ * since the previous frame (scrolling water, waterfalls, anything animated)
+ * has no pair, and drawn where the new frame has it it stood still while the
+ * surfaces around it were moved back: it shook against them 30 times a
+ * second. A mesh shares its corners, so each corner of an orphan takes the
+ * motion a paired neighbour has for that same corner; corners no neighbour
+ * knows take the mean of the ones found, and an orphan with none takes the
+ * motion of the nearest paired primitive in draw order. */
+#define FG_VH 32768
+static void fg_orphans(const FgList *prev, FgList *cur) {
+    static uint32_t vk[FG_VH]; static float vx[FG_VH], vy[FG_VH];
+    static int near_idx[FG_MAX_CMDS];
+    memset(vk, 0, sizeof vk);
+    int last = -1, orphans = 0;
+    for (int i = 0; i < cur->n; i++) {
+        FgCmd *c = &cur->c[i];
+        near_idx[i] = last;
+        if (c->op < FG_FIRST_PRIM || fg_is_backdrop(c)) continue;
+        const int paired = c->used && c->next >= 0;
+        if (!paired && !c->ovr) { orphans++; continue; }
+        last = i;
+        const int nv = kFgPos[c->op].nv;
+        if (nv != 3) continue;
+        const FgCmd *p = paired ? &prev->c[c->next] : NULL;
+        for (int v = 0; v < 3; v++) {
+            const int xi = kFgPos[c->op].xi[v], yi = kFgPos[c->op].yi[v];
+            float dx, dy;
+            if (c->ovr || !p) { dx = c->sdx; dy = c->sdy; }
+            else {
+                const float cx = c->pc_valid ? c->pcx[v] : (float)c->a[xi];
+                const float cy = c->pc_valid ? c->pcy[v] : (float)c->a[yi];
+                dx = cx - ((p->pc_valid ? p->pcx[v] : (float)p->a[xi]) - (float)p->offx + (float)c->offx);
+                dy = cy - ((p->pc_valid ? p->pcy[v] : (float)p->a[yi]) - (float)p->offy + (float)c->offy);
+            }
+            const uint32_t k = ((uint32_t)(uint16_t)c->a[xi] << 16 | (uint16_t)c->a[yi]) | 0x80000000u;
+            uint32_t h = (k * 2654435761u) >> 17;
+            for (int t = 0; t < 8; t++, h = (h + 1) & (FG_VH - 1)) {
+                if (vk[h] == k) break;
+                if (!vk[h]) { vk[h] = k; vx[h] = dx; vy[h] = dy; break; }
+            }
+        }
+    }
+    s_fg_stat_orph += (unsigned)orphans;
+    if (!orphans) return;
+    last = -1;
+    for (int i = cur->n - 1; i >= 0; i--) {     /* nearest paired primitive on either side */
+        const FgCmd *c = &cur->c[i];
+        const int before = near_idx[i];
+        near_idx[i] = (before >= 0 && (last < 0 || i - before <= last - i)) ? before : last;
+        if (c->op >= FG_FIRST_PRIM && !fg_is_backdrop(c) && ((c->used && c->next >= 0) || c->ovr)) last = i;
+    }
+    for (int i = 0; i < cur->n; i++) {
+        FgCmd *c = &cur->c[i];
+        if (c->op < FG_FIRST_PRIM || fg_is_backdrop(c) || (c->used && c->next >= 0) || c->ovr) continue;
+        const int nv = kFgPos[c->op].nv;
+        int found = 0; float sx = 0, sy = 0; int have[3] = { 0, 0, 0 };
+        if (nv == 3) {
+            for (int v = 0; v < 3; v++) {
+                const int xi = kFgPos[c->op].xi[v], yi = kFgPos[c->op].yi[v];
+                const uint32_t k = ((uint32_t)(uint16_t)c->a[xi] << 16 | (uint16_t)c->a[yi]) | 0x80000000u;
+                uint32_t h = (k * 2654435761u) >> 17;
+                for (int t = 0; t < 8 && vk[h]; t++, h = (h + 1) & (FG_VH - 1))
+                    if (vk[h] == k) { c->vdx[v] = vx[h]; c->vdy[v] = vy[h]; have[v] = 1; found++; sx += vx[h]; sy += vy[h]; break; }
+            }
+        }
+        if (found) {
+            for (int v = 0; v < 3; v++) if (!have[v]) { c->vdx[v] = sx / (float)found; c->vdy[v] = sy / (float)found; }
+            c->ovr = 4; s_fg_stat_orph_vert++;
+        } else if (near_idx[i] >= 0) {
+            const FgCmd *q = &cur->c[near_idx[i]];
+            if (fabsf(q->sdx) <= 72.0f && fabsf(q->sdy) <= 72.0f) {
+                c->sdx = q->sdx; c->sdy = q->sdy; c->ovr = 1; s_fg_stat_orph_near++;
+            }
+        }
+    }
+}
+
 /* The 2D backdrop (sky/water tile grids) moves as one rigid layer, and its
  * tiles repeat, so pairing them one by one by nearest position picks wrong
  * neighbours: tiles jumped and left holes in the generated picture. Backdrop
@@ -5062,6 +5141,18 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
             if (c->a[xi] - c->offx != p->a[xi] - p->offx || c->a[yi] - c->offy != p->a[yi] - p->offy) same = 0;
         }
         if (same) bdrop = 0;
+    }
+    if (c->ovr == 4 && nv == 3) {
+        s_pq_valid = c->pq_valid;
+        for (int i = 0; i < 3; i++) {
+            const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
+            s_pq[i] = c->pq[i];
+            s_pc_x[i] = (c->pc_valid ? c->pcx[i] : (float)c->a[xi]) - c->vdx[i] * (1.0f - s_fg_t);
+            s_pc_y[i] = (c->pc_valid ? c->pcy[i] : (float)c->a[yi]) - c->vdy[i] * (1.0f - s_fg_t);
+            a[xi] = (int32_t)floorf(s_pc_x[i]); a[yi] = (int32_t)floorf(s_pc_y[i]);
+        }
+        s_pc_valid = 1;
+        p = NULL; goto emit;
     }
     if (bdrop || c->ovr) {
         /* Rigid shift: back from where it is now by the part of the frame's
@@ -5216,6 +5307,7 @@ void vk_renderer_display_flip(void) {
         cur->wide_prims >= 24 && prev->wide_prims >= 24) {
         const int matched = fg_match(prev, cur);
         fg_regularize(prev, cur);
+        if (!getenv("PSX_VK_FG_NO_ORPHANS")) fg_orphans(prev, cur);
         s_fg_stat_prims += (unsigned)cur->prims; s_fg_stat_matched += (unsigned)matched;
         const int mode = fg_enabled();
         const int want = (mode >= 2 && fg_120_ok()) ? (mode == 2 ? 2 : 3) : 1;
@@ -5232,12 +5324,15 @@ void vk_renderer_display_flip(void) {
         }
     }
     if (s_fg_stat_flips >= 300) {
-        fprintf(stdout, "psxrecomp: vulkan: frame generation: %u of %u frames got an in-between picture, %u%% of primitives matched (last frame: %d cmds, %d prims, %d wide; wide_w %d)\n",
+        fprintf(stdout, "psxrecomp: vulkan: frame generation: %u of %u frames got an in-between picture, %u%% of primitives matched, %u orphans/frame (%u by corners, %u by neighbour) (last frame: %d cmds, %d prims, %d wide; wide_w %d)\n",
                 s_fg_stat_made, s_fg_stat_flips,
                 s_fg_stat_prims ? (unsigned)((uint64_t)s_fg_stat_matched * 100u / s_fg_stat_prims) : 0u,
+                s_fg_stat_orph / (s_fg_stat_flips ? s_fg_stat_flips : 1u), s_fg_stat_orph_vert / (s_fg_stat_flips ? s_fg_stat_flips : 1u),
+                s_fg_stat_orph_near / (s_fg_stat_flips ? s_fg_stat_flips : 1u),
                 cur->n, cur->prims, cur->wide_prims, s_wide_w);
         fflush(stdout);
         s_fg_stat_flips = s_fg_stat_made = s_fg_stat_prims = s_fg_stat_matched = 0;
+        s_fg_stat_orph = s_fg_stat_orph_vert = s_fg_stat_orph_near = 0;
     }
     s_fg_cur ^= 1;                                /* cur becomes prev; old prev is reused */
     s_fg_list[s_fg_cur].n = s_fg_list[s_fg_cur].prims = s_fg_list[s_fg_cur].wide_prims = 0;
