@@ -2457,6 +2457,10 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
         if (ok && s_fg_n == 1) i = g[0];
     } else {
         s_fg_hold = 0;
+        /* Diagnostic: PSX_VK_FG_DEBUG=1 shows only generated pictures. */
+        static int dbg = -1;
+        if (dbg < 0) { const char *e = getenv("PSX_VK_FG_DEBUG"); dbg = e && *e == '1'; }
+        if (dbg && s_fg_n >= 1 && s_fg_surfs[0] >= 0 && s_wide_img[s_fg_surfs[0]]) i = s_fg_surfs[0];
     }
     return present_wide_surf(i, disp_y, disp_h, linear);
 }
@@ -4362,6 +4366,40 @@ static int fg_match(FgList *prev, FgList *cur) {
     return matched;
 }
 
+/* The 2D backdrop (sky/water tile grids) moves as one rigid layer, and its
+ * tiles repeat, so pairing them one by one by nearest position picks wrong
+ * neighbours: tiles jumped and left holes in the generated picture. Backdrop
+ * primitives are instead all moved by the layer's median frame-to-frame
+ * shift. */
+static int   s_fg_bd_have;
+static float s_fg_bd_dx, s_fg_bd_dy;
+static int fg_is_backdrop(const FgCmd *c) {
+    if (c->op == FG_LN || c->op == FG_SLN) return 0;
+    const int textured = (c->op == FG_TT || c->op == FG_STT || c->op == FG_TR || c->op == FG_TRS);
+    return (c->bd & 1) || (!textured && (c->bd & 2));
+}
+static int fg_cmp_float(const void *a, const void *b) {
+    const float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+static void fg_backdrop_shift(const FgList *prev, const FgList *cur) {
+    static float dx[2048], dy[2048];
+    int n = 0;
+    for (int i = 0; i < cur->n && n < 2048; i++) {
+        const FgCmd *c = &cur->c[i];
+        if (c->op < FG_FIRST_PRIM || !c->used || c->next < 0 || !fg_is_backdrop(c)) continue;
+        float cx, cy, px, py;
+        fg_centre(c, &cx, &cy); fg_centre(&prev->c[c->next], &px, &py);
+        dx[n] = cx - px; dy[n] = cy - py; n++;
+    }
+    s_fg_bd_have = n > 0;
+    s_fg_bd_dx = s_fg_bd_dy = 0.0f;
+    if (!n) return;
+    qsort(dx, (size_t)n, sizeof(float), fg_cmp_float);
+    qsort(dy, (size_t)n, sizeof(float), fg_cmp_float);
+    s_fg_bd_dx = dx[n / 2]; s_fg_bd_dy = dy[n / 2];
+}
+
 /* Draw `c` halfway toward its pair `p` (NULL = where it is). */
 static void fg_emit(const FgCmd *c, const FgCmd *p) {
     int32_t a[20];
@@ -4369,6 +4407,27 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
     const int op = c->op, nv = kFgPos[op].nv;
     s_fg_bd_bits = c->bd;
     s_pc_valid = 0; s_pq_valid = 0;
+    if (fg_is_backdrop(c)) {
+        /* Rigid layer shift: back from where it is now by the part of the
+         * frame's motion that has not happened yet at time t. */
+        const float bx = s_fg_bd_have ? s_fg_bd_dx * (1.0f - s_fg_t) : 0.0f;
+        const float by = s_fg_bd_have ? s_fg_bd_dy * (1.0f - s_fg_t) : 0.0f;
+        if (nv == 3) {
+            s_pq_valid = c->pq_valid;
+            for (int i = 0; i < 3; i++) {
+                const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
+                s_pq[i] = c->pq[i];
+                s_pc_x[i] = (c->pc_valid ? c->pcx[i] : (float)c->a[xi]) - bx;
+                s_pc_y[i] = (c->pc_valid ? c->pcy[i] : (float)c->a[yi]) - by;
+                a[xi] = (int32_t)floorf(s_pc_x[i]); a[yi] = (int32_t)floorf(s_pc_y[i]);
+            }
+            s_pc_valid = 1;
+        } else {
+            const int sx = (int)floorf(bx + 0.5f), sy = (int)floorf(by + 0.5f);
+            for (int i = 0; i < nv; i++) { a[kFgPos[op].xi[i]] -= sx; a[kFgPos[op].yi[i]] -= sy; }
+        }
+        p = NULL; goto emit;
+    }
     if (nv == 3) {
         s_pq_valid = c->pq_valid;
         for (int i = 0; i < 3; i++) s_pq[i] = c->pq[i];
@@ -4395,6 +4454,7 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
             a[yi] = (int32_t)floorf((float)py + (float)(c->a[yi] - py) * s_fg_t + 0.5f);
         }
     }
+emit:
     switch (op) {
     case FG_FT:  vkb_draw_flat_triangle(a[0],a[1],a[2],a[3],a[4],a[5],(uint16_t)a[6]); break;
     case FG_GT:  vkb_draw_gouraud_triangle(a[0],a[1],(uint16_t)a[2],a[3],a[4],(uint16_t)a[5],a[6],a[7],(uint16_t)a[8]); break;
@@ -4422,6 +4482,7 @@ static int fg_build(FgList *prev, FgList *cur, int k, float t) {
     s_fg_surf = s_fg_surfs[k];
     if (s_fg_surf < 0) return 0;
     s_fg_t = t;
+    fg_backdrop_shift(prev, cur);
 
     FgState live;
     fg_state_get(&live);
