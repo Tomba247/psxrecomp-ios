@@ -413,13 +413,14 @@ static unsigned         s_hd_stat_miss, s_hd_stat_upload, s_hd_stat_direct, s_hd
 /* Animated textures (water, palette cycling): the game rewrites those VRAM
  * words every few frames, and a pack rarely holds every frame of the
  * animation, so the picture alternated between replacement and original.
- * VRAM is tracked in 64x64-word tiles; a tile written in 12 or more of the
- * last 32 frames is "animated" and its texels are never replaced. */
+ * VRAM is tracked in 64x64-word tiles; a tile that keeps being rewritten is
+ * "animated" (see hd_flip_tick) and its texels are never replaced. */
 static int s_hd_ready;
 #define HD_TILE_W 16
 #define HD_TILE_H 8
 static uint32_t s_hd_wr_last[HD_TILE_H][HD_TILE_W];
 static uint8_t  s_hd_wr_cnt[HD_TILE_H][HD_TILE_W], s_hd_anim[HD_TILE_H][HD_TILE_W];
+static uint8_t  s_hd_run[HD_TILE_H][HD_TILE_W], s_hd_quiet[HD_TILE_H][HD_TILE_W];
 static unsigned s_hd_flip;      /* flips seen by the tracker */
 static int hd_rect_animated(int x0, int y0, int x1, int y1) {
     if (x1 < x0 || y1 < y0) return 0;
@@ -520,10 +521,18 @@ static void hd_flip_tick(void) {
     int changed = 0;
     for (int ty = 0; ty < HD_TILE_H; ty++)
         for (int tx = 0; tx < HD_TILE_W; tx++) {
-            /* Hysteresis: animated at 12+ of 32 frames, static again only at
-             * 2 or fewer, so a tile near the threshold does not flip. */
+            /* A texture that is loaded is written once; one that is written
+             * again and again is an animation, however slow (a waterfall
+             * steps every few frames, a palette cycle once a second). Two
+             * writes in a window, or a write in each of three windows in a
+             * row, make the tile animated; it stays so until ten windows
+             * (about ten seconds) pass without any write. */
             const uint8_t c = s_hd_wr_cnt[ty][tx];
-            const uint8_t a = c >= 12 ? 1 : c <= 2 ? 0 : s_hd_anim[ty][tx];
+            uint8_t a = s_hd_anim[ty][tx];
+            if (c) { if (s_hd_run[ty][tx] < 255) s_hd_run[ty][tx]++; s_hd_quiet[ty][tx] = 0; }
+            else   { s_hd_run[ty][tx] = 0; if (s_hd_quiet[ty][tx] < 255) s_hd_quiet[ty][tx]++; }
+            if (c >= 2 || s_hd_run[ty][tx] >= 3) a = 1;
+            else if (s_hd_quiet[ty][tx] >= 10) a = 0;
             if (a != s_hd_anim[ty][tx]) { s_hd_anim[ty][tx] = a; changed = 1; }
             s_hd_wr_cnt[ty][tx] = 0;
         }
