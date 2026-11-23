@@ -319,7 +319,7 @@ static VkImageLayout   s_up_layout = VK_IMAGE_LAYOUT_UNDEFINED;
  * VkFramebuffer on the SHARED render pass, so every existing pipeline works
  * unchanged. The mirror is appended to the SAME one-shot command buffer as the
  * canonical pass — one extra render pass per flushed batch, no extra submits. */
-#define VK_WIDE_MAX_SURF 4
+#define VK_WIDE_MAX_SURF 6
 static VkImage        s_wide_img[VK_WIDE_MAX_SURF];
 static VkDeviceMemory s_wide_mem[VK_WIDE_MAX_SURF];
 static VkImageView    s_wide_view[VK_WIDE_MAX_SURF];
@@ -328,7 +328,7 @@ static VkDeviceMemory s_wide_ds_mem[VK_WIDE_MAX_SURF];
 static VkImageView    s_wide_ds_view[VK_WIDE_MAX_SURF];
 static VkFramebuffer  s_wide_fb[VK_WIDE_MAX_SURF];
 static VkImageLayout  s_wide_layout[VK_WIDE_MAX_SURF];
-static int            s_wide_base[VK_WIDE_MAX_SURF] = { -1, -1, -1, -1 };
+static int            s_wide_base[VK_WIDE_MAX_SURF] = { -1, -1, -1, -1, -1, -1 };
 static int            s_wide_w = 0;        /* wide width (native px); 0 = disabled */
 static int            s_wide_offset = 0;   /* centering OFFSET (native px) */
 static int            s_wide_cur = -1;     /* active mirror surface index, -1 = none */
@@ -336,7 +336,12 @@ static int            s_wide_cur_base = 0;
 /* Frame generation (see the fg_* block): while s_fg_replay is set the draw
  * paths render ONLY the wide mirror pass, into surface s_fg_surf. */
 static int            s_fg_replay = 0;
-static int            s_fg_surf = -1;
+static int            s_fg_surf = -1;      /* surface the replay draws into */
+static int            s_fg_surfs[3] = { -1, -1, -1 };   /* generated pictures of this frame */
+static int            s_fg_n = 0;          /* how many of them are valid (1 = 60 fps, 3 = 120) */
+static int            s_fg_next = 0;       /* next one to show */
+static float          s_fg_t = 0.5f;       /* position of the picture being built, prev -> cur */
+static int            s_fg_120_off = 0;    /* 120 turned itself off (display cannot keep up) */
 static int            s_fg_hold = 0;       /* a generated picture waits for the next present */
 static uint32_t       s_fg_hold_stamp = 0;
 static void wide_free_all(void);           /* defined with the wide helpers below */
@@ -404,6 +409,10 @@ static void perf_snapshot_present(void) {
                 fprintf(stdout, "psxrecomp: vulkan: per picture: %.0f batches in %.1f wide passes, "
                                 "batch CPU %.2f ms, pass replay CPU %.2f ms\n",
                         (double)flushes / n, (double)passes / n, s_t_flush * f, s_t_close * f);
+            }
+            if (s_fg_n == 3 && !s_fg_120_off && (acq_us + pres_us) / n > 4500) {
+                s_fg_120_off = 1;   /* presents are blocking: the display is not taking 120 */
+                fprintf(stdout, "psxrecomp: vulkan: 120 fps mode turned off, the display is not accepting pictures that fast\n");
             }
             fflush(stdout);
             s_t_flush = s_t_close = 0; flushes = passes = 0;
@@ -2384,17 +2393,38 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
  * gl_renderer_present_wide_fbo. Letterbox aspect generalises past 16:9:
  * the 4:3 native frame widened by EXTRA presents at (4*wide_w : 3*native_w).
  * Returns 0 when no wide surface exists for disp_x (caller falls back). */
+static int present_wide_surf(int i, int disp_y, int disp_h, int linear);
 int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     if (!s_ctx_ok || !s_ready || s_wide_w <= 0) return 0;
     int i = -1;
     for (int k = 0; k < VK_WIDE_MAX_SURF; k++)
         if (s_wide_img[k] && s_wide_base[k] == disp_x) { i = k; break; }
     if (i < 0) return 0;
-    if (s_fg_hold) {   /* show the generated in-between picture first */
+    if (s_fg_hold && s_present_idx - s_fg_hold_stamp <= 5) {
+        /* Generated in-between pictures go out before the real frame. At 120
+         * two pictures are queued per vblank; the FIFO swapchain shows them on
+         * consecutive display refreshes. */
+        int g[3], ok = 1;
+        for (int k = 0; k < s_fg_n; k++) { g[k] = s_fg_surfs[k]; if (g[k] < 0 || !s_wide_img[g[k]]) ok = 0; }
+        if (ok && s_fg_n == 3) {
+            if (s_fg_next == 0) {
+                s_fg_next = 2;
+                present_wide_surf(g[0], disp_y, disp_h, linear);
+                return present_wide_surf(g[1], disp_y, disp_h, linear);
+            }
+            s_fg_hold = 0;
+            present_wide_surf(g[2], disp_y, disp_h, linear);
+            return present_wide_surf(i, disp_y, disp_h, linear);
+        }
         s_fg_hold = 0;
-        if (s_fg_surf >= 0 && s_wide_img[s_fg_surf] && s_present_idx - s_fg_hold_stamp <= 2)
-            i = s_fg_surf;
+        if (ok && s_fg_n == 1) i = g[0];
+    } else {
+        s_fg_hold = 0;
     }
+    return present_wide_surf(i, disp_y, disp_h, linear);
+}
+
+static int present_wide_surf(int i, int disp_y, int disp_h, int linear) {
     flush_cpu_upload();
     flush_tex_batch(); flush_geometry(); gpu_sync();
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
@@ -3107,6 +3137,42 @@ static void set_vp_scissor(VkCommandBuffer cb) {
 static int view_enabled, view_shift, view_pad_left, view_pad_right;
 static int wide_dx(void) { return s_wide_offset + view_shift - s_wide_cur_base; }
 
+/* 2D-backdrop stretch (ported from the GL/SW renderers). The game's sky and
+ * water backdrops bypass the GTE, so in native-wide they stay 4:3 wide and
+ * leave black margins. Gated per primitive exactly like GL's bd_prim_gate; the
+ * gate is a batch key, and the wide mirror of a gated batch is scaled about
+ * the 4:3 centre so it fills the wide frame. Canonical VRAM is untouched. */
+extern int psx_ws_prim_in_backdrop(void);
+extern int gpu_ws_nw_flat_backdrop_enabled(void);
+static int s_fg_bd_bits;             /* gate bits of the command being replayed */
+static int s_geo_gate, s_tb_gate;    /* gate of the open untextured / textured batch */
+static int vk_bd_bits(void) {
+    if (s_fg_replay) return s_fg_bd_bits;
+    if (s_wide_cur < 0 || s_wide_w <= 0) return 0;
+    int b = 0;
+    if (psx_ws_prim_in_backdrop() == 1) b |= 1;
+    if (gpu_ws_nw_flat_backdrop_enabled()) b |= 2;
+    return b;
+}
+static int vk_bd_gate(int textured, int is_line) {
+    if (s_wide_cur < 0 || s_wide_w <= 0) return 0;
+    if (!textured && is_line) return 0;      /* ropes/wires belong to the 3D scene */
+    const int b = vk_bd_bits();
+    if (!textured && (b & 2)) return 1;
+    return b & 1;
+}
+/* Vertex transform of a wide-mirror draw: clip_x = (x + xoff) / xhalf - 1. */
+static void wide_xform(int gate, float *xoff, float *xhalf) {
+    const float half = (float)s_wide_w / 2.0f;
+    *xoff = (float)wide_dx(); *xhalf = half;
+    const int native_w = s_wide_w - 2 * s_wide_offset;
+    if (!gate || native_w <= 0 || native_w >= s_wide_w) return;
+    const float k = (float)s_wide_w / (float)native_w;
+    const float centre = (float)s_wide_cur_base + (float)native_w / 2.0f;
+    *xhalf = half / k;
+    *xoff = *xhalf * (1.0f + (float)view_shift / half) - centre;
+}
+
 static void wide_free_all(void) {
     int any = 0;
     for (int i = 0; i < VK_WIDE_MAX_SURF; i++) any |= (s_wide_img[i] != VK_NULL_HANDLE);
@@ -3124,7 +3190,8 @@ static void wide_free_all(void) {
         s_wide_base[i] = -1;
     }
     s_wide_cur = -1;
-    s_fg_surf = -1; s_fg_hold = 0;
+    s_fg_surf = -1; s_fg_hold = 0; s_fg_n = 0;
+    s_fg_surfs[0] = s_fg_surfs[1] = s_fg_surfs[2] = -1;
 }
 
 /* Find (or lazily create) the wide surface for base_x. Returns the surface
@@ -3346,7 +3413,8 @@ static void flush_geometry(void) {
     }
     if (s_wide_cur >= 0 && !s_geo_mirror_suppress) {   /* native-wide mirror (queued) */
         WideRec *r = wq_push(0, semi, s_geo_check, s_geo_mask, base, n);
-        GeoPush wgp = { px_shift(), (float)wide_dx(), (float)s_wide_w / 2.0f };
+        GeoPush wgp = { px_shift(), 0.0f, 0.0f };
+        wide_xform(s_geo_gate, &wgp.xoff, &wgp.xhalf);
         r->gp = wgp;
     }
     s_geo_mirror_suppress = 0;
@@ -3391,13 +3459,15 @@ static void ensure_room(uint32_t need) {
 /* Open / continue an untextured batch with the current blend/mask state; drains
  * the textured batch and any differently-keyed untextured batch first (PS1
  * submission order). */
-static void geo_prim_begin(void) {
+static void geo_prim_begin(int is_line) {
     flush_cpu_upload();   /* pending CPU writes precede this prim (PS1 order) */
     flush_tex_batch();
     int semi = s_semi_en ? s_semi_mode : -1;
-    if (s_vcount > 0 && (semi != s_geo_semi || s_mask_set != s_geo_mask || s_mask_check != s_geo_check))
+    const int gate = vk_bd_gate(0, is_line);
+    if (s_vcount > 0 && (semi != s_geo_semi || s_mask_set != s_geo_mask || s_mask_check != s_geo_check ||
+                         gate != s_geo_gate))
         flush_geometry();
-    if (s_vcount == 0) { s_geo_semi = semi; s_geo_mask = s_mask_set; s_geo_check = s_mask_check; }
+    if (s_vcount == 0) { s_geo_semi = semi; s_geo_mask = s_mask_set; s_geo_check = s_mask_check; s_geo_gate = gate; }
 }
 
 static void tri3(float ax,float ay,const float ca[3],
@@ -3456,13 +3526,13 @@ static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; }
 #define PCY(i, v) (s_pc_valid ? s_pc_y[i] : (float)(v))
 
 static void vkb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t c){
-    geo_prim_begin();
+    geo_prim_begin(0);
     float col[3]; col555(c, col);
     tri3(PCX(0,x0),PCY(0,y0),col, PCX(1,x1),PCY(1,y1),col, PCX(2,x2),PCY(2,y2),col);
     precise_consumed();
 }
 static void vkb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int x2,int y2,uint16_t c2){
-    geo_prim_begin();
+    geo_prim_begin(0);
     float a[3],b[3],cc[3]; col555(c0,a); col555(c1,b); col555(c2,cc);
     tri3(PCX(0,x0),PCY(0,y0),a, PCX(1,x1),PCY(1,y1),b, PCX(2,x2),PCY(2,y2),cc);
     precise_consumed();
@@ -3509,7 +3579,7 @@ static void vkb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
         overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
     }
     if (overlay) { flush_tex_batch(); flush_geometry(); }
-    geo_prim_begin();
+    geo_prim_begin(0);
     float col[3]; col555(c, col);
     if (overlay) s_geo_mirror_suppress = 1;
     quad((float)x,(float)y,(float)(x+w),(float)y,(float)(x+w),(float)(y+h),(float)x,(float)(y+h),col);
@@ -3532,11 +3602,11 @@ static void line_quad(int x0,int y0,int x1,int y1,const float ca[3],const float 
     tri3(ax0,ay0,ca, bx1,by1,cb_, bx0,by0,ca);
 }
 static void vkb_draw_line(int x0,int y0,int x1,int y1,uint16_t c){
-    geo_prim_begin();
+    geo_prim_begin(1);
     float col[3]; col555(c, col); line_quad(x0,y0,x1,y1,col,col);
 }
 static void vkb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1){
-    geo_prim_begin();
+    geo_prim_begin(1);
     float a[3],b[3]; col555(c0,a); col555(c1,b); line_quad(x0,y0,x1,y1,a,b);
 }
 
@@ -3599,7 +3669,7 @@ static void flush_tex_batch(void) {
     }   /* !s_fg_replay */
     if (s_wide_cur >= 0) {                 /* native-wide mirror (queued) */
         WideRec *r = wq_push(1, semi, s_tb_check, s_tb_mask, base, n);
-        tp.xoff = (float)wide_dx(); tp.xhalf = (float)s_wide_w / 2.0f;
+        wide_xform(s_tb_gate, &tp.xoff, &tp.xhalf);
         r->tp = tp;
     }
     end_oneshot(cb);
@@ -3621,6 +3691,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     if (!s_ready) return;
     int lim_buf[4];
     int uv_buf[6];
+    const int texfilter = (s_texfilter || (!lim && touch_ui_tex_smooth())) ? 1 : 0;
     if (!lim) {
         /* Poly path: exact sampled bounds from the ORIGINAL uvs, then the
          * center-sampling mirror compensation (rect prims arrive with their
@@ -3645,9 +3716,10 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
      * see flush_tex_batch). It drains the open batch and draws alone; the next
      * append flushes it out again. Opaque prims keep batching. */
     int isolate = (semi >= 0);
+    const int gate = vk_bd_gate(1, 0);
     if (s_tcount > 0 &&
-        (isolate || semi != s_tb_semi || s_mask_set != s_tb_mask || s_mask_check != s_tb_check ||
-         s_texfilter != s_tb_filter ||
+        (isolate || gate != s_tb_gate || semi != s_tb_semi || s_mask_set != s_tb_mask || s_mask_check != s_tb_check ||
+         texfilter != s_tb_filter ||
          twx != s_tb_twin[0] || twy != s_tb_twin[1] || tox != s_tb_twin[2] || toy != s_tb_twin[3]))
         flush_tex_batch();
     if (s_tbase + s_tcount + 3 > VK_TBUF_VERTS) {
@@ -3656,7 +3728,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
             gpu_sync();   /* buffer exhausted: wait idle, cursors recycle to 0 */
     }
     if (s_tcount == 0) {
-        s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_check = s_mask_check; s_tb_filter = s_texfilter;
+        s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_check = s_mask_check; s_tb_filter = texfilter;
+        s_tb_gate = gate;
         s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
     }
     int bx0 = xs[0], bx1 = xs[0], by0 = ys[0], by1 = ys[0];
@@ -3965,7 +4038,7 @@ enum { FG_SEMI, FG_MASK, FG_TWIN, FG_MOD, FG_DA, FG_OFF, FG_VIEW, FG_WSET, FG_WD
 #define FG_BASE 0x40000000     /* wide-surface key of the generated picture */
 
 typedef struct {
-    uint8_t op, pc_valid, pq_valid, used;
+    uint8_t op, pc_valid, pq_valid, used, bd;
     int16_t offx, offy;
     int32_t a[20];
     float pcx[3], pcy[3], pq[3];
@@ -4011,9 +4084,9 @@ static const int kFgArgs[FG_OPS] = {
 static int fg_enabled(void) {
     if (s_fg_on < 0) {
         const char *e = getenv("PSX_VK_FRAMEGEN");
-        s_fg_on = (e && *e) ? (*e != '0') : 2;   /* 2 = follow the settings panel */
+        s_fg_on = (e && *e) ? (*e == '0' ? 0 : *e == '2' ? 2 : 1) : -2;   /* -2 = follow the settings panel */
     }
-    return s_fg_on == 2 ? touch_ui_framegen() : s_fg_on;
+    return s_fg_on == -2 ? touch_ui_framegen() : s_fg_on;
 }
 
 static void fg_state_get(FgState *s) {
@@ -4068,6 +4141,7 @@ static void fg_rec_prim(int op, const int32_t *args) {
     FgCmd *c = fg_rec(op);
     if (!c) return;
     const int n = kFgArgs[op];
+    c->bd = (uint8_t)vk_bd_bits();
     memcpy(c->a, args, sizeof(int32_t) * (size_t)n);
     if (kFgPos[op].nv == 3) {
         c->pc_valid = (uint8_t)s_pc_valid; c->pq_valid = (uint8_t)s_pq_valid;
@@ -4214,6 +4288,7 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
     int32_t a[20];
     memcpy(a, c->a, sizeof a);
     const int op = c->op, nv = kFgPos[op].nv;
+    s_fg_bd_bits = c->bd;
     s_pc_valid = 0; s_pq_valid = 0;
     if (nv == 3) {
         s_pq_valid = c->pq_valid;
@@ -4225,7 +4300,7 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
                 const float cy = c->pc_valid ? c->pcy[i] : (float)c->a[yi];
                 const float px = (p->pc_valid ? p->pcx[i] : (float)p->a[xi]) - (float)p->offx + (float)c->offx;
                 const float py = (p->pc_valid ? p->pcy[i] : (float)p->a[yi]) - (float)p->offy + (float)c->offy;
-                s_pc_x[i] = (cx + px) * 0.5f; s_pc_y[i] = (cy + py) * 0.5f;
+                s_pc_x[i] = px + (cx - px) * s_fg_t; s_pc_y[i] = py + (cy - py) * s_fg_t;
                 a[xi] = (int32_t)floorf(s_pc_x[i]); a[yi] = (int32_t)floorf(s_pc_y[i]);
             }
             s_pc_valid = 1;
@@ -4237,7 +4312,8 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
         for (int i = 0; i < nv; i++) {
             const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
             const int px = p->a[xi] - p->offx + c->offx, py = p->a[yi] - p->offy + c->offy;
-            a[xi] = (c->a[xi] + px) >> 1; a[yi] = (c->a[yi] + py) >> 1;
+            a[xi] = (int32_t)floorf((float)px + (float)(c->a[xi] - px) * s_fg_t + 0.5f);
+            a[yi] = (int32_t)floorf((float)py + (float)(c->a[yi] - py) * s_fg_t + 0.5f);
         }
     }
     switch (op) {
@@ -4260,11 +4336,13 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
 
 /* Render the picture halfway between `prev` and `cur` into the private wide
  * surface. Returns 1 when it was drawn. */
-static int fg_build(FgList *prev, FgList *cur) {
+static int fg_build(FgList *prev, FgList *cur, int k, float t) {
     flush_cpu_upload();
     flush_tex_batch(); flush_geometry();
-    if (s_fg_surf < 0 || !s_wide_img[s_fg_surf]) s_fg_surf = wide_surf_for(FG_BASE);
+    if (s_fg_surfs[k] < 0 || !s_wide_img[s_fg_surfs[k]]) s_fg_surfs[k] = wide_surf_for(FG_BASE + k);
+    s_fg_surf = s_fg_surfs[k];
     if (s_fg_surf < 0) return 0;
+    s_fg_t = t;
 
     FgState live;
     fg_state_get(&live);
@@ -4312,6 +4390,21 @@ static int fg_build(FgList *prev, FgList *cur) {
     return 1;
 }
 
+/* 120 needs a display that refreshes that fast: pictures queue on a FIFO
+ * swapchain, so a 60 Hz panel would halve the game's speed. */
+static int fg_120_ok(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        const char *e = getenv("PSX_VK_FORCE_120");
+SDL_DisplayMode dm;   /* psx_sdl.h keeps the SDL2 call shape on SDL3 too */
+        const float hz = SDL_GetCurrentDisplayMode(0, &dm) == 0 ? (float)dm.refresh_rate : 0.0f;
+        ok = (e && *e == '1') || hz >= 110.0f;
+        fprintf(stdout, "psxrecomp: vulkan: display %.1f Hz, 120 fps mode %s\n", hz, ok ? "available" : "not available (needs a 120 Hz display)");
+        fflush(stdout);
+    }
+    return ok && !s_fg_120_off;
+}
+
 /* GP1(05h): the guest switched the displayed buffer, so the list recorded
  * since the last switch is a finished frame. */
 void vk_renderer_display_flip(void) {
@@ -4326,7 +4419,13 @@ void vk_renderer_display_flip(void) {
         cur->wide_prims >= 24 && prev->wide_prims >= 24) {
         const int matched = fg_match(prev, cur);
         s_fg_stat_prims += (unsigned)cur->prims; s_fg_stat_matched += (unsigned)matched;
-        if (matched * 2 >= cur->prims && fg_build(prev, cur)) {
+        const int want = (fg_enabled() == 2 && fg_120_ok()) ? 3 : 1;
+        int made = 0;
+        if (matched * 2 >= cur->prims)
+            for (; made < want; made++)
+                if (!fg_build(prev, cur, made, (float)(made + 1) / (float)(want + 1))) break;
+        if (made == want) {
+            s_fg_n = want; s_fg_next = 0;
             s_fg_hold = 1;
             s_fg_hold_stamp = s_present_idx;
             s_fg_stat_made++;

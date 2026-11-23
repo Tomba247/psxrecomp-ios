@@ -38,11 +38,13 @@ int  touch_ui_canvas(int sc_w, int sc_h, const uint32_t **px, int *w, int *h,
 void touch_ui_presented(void);
 /* 1 = stretch the picture over the whole screen instead of letterboxing. */
 int  touch_ui_fit_screen(void);
-/* 1 = generate in-between pictures for 60 fps (Vulkan frame generation). */
+/* Frame generation (Vulkan): 0 = off, 1 = 60 fps, 2 = 120 fps. */
 int  touch_ui_framegen(void);
 /* Internal resolution chosen in the panel for THIS run: 0 = the game's
  * default, else a 1..6 x scale. A change applies at the next start. */
 int  touch_ui_resolution(void);
+/* 1 = bilinear filtering of polygon textures. */
+int  touch_ui_tex_smooth(void);
 
 #ifdef __cplusplus
 }
