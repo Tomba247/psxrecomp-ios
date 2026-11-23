@@ -2645,9 +2645,59 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     return present_wide_surf(i, disp_y, disp_h, linear);
 }
 
+/* Diagnostic: PSX_VK_SEQ_DUMP=<dir>. Creating <dir>/go dumps the next 48
+ * presented pictures, in presentation order, as raw RGBA files. */
+static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, void **map);
+static void seq_dump(int i, int disp_y, int disp_h) {
+    static const char *dir; static int init, left, serial, step = 1, count = 48;
+    if (!init) {
+        init = 1; dir = getenv("PSX_VK_SEQ_DUMP");
+        const char *st = getenv("PSX_VK_SEQ_STEP");
+        if (st && atoi(st) > 0) step = atoi(st);
+        st = getenv("PSX_VK_SEQ_COUNT");
+        if (st && atoi(st) > 0) count = atoi(st);
+    }
+    if (!dir || !*dir) return;
+    char path[512];
+    if (!left) {
+        if ((s_present_idx & 15u) != 0) return;
+        snprintf(path, sizeof path, "%s/go", dir);
+        if (remove(path) != 0) return;
+        left = count; serial = 0;
+    }
+    if (step > 1 && (s_present_idx % (unsigned)step) != 0) return;
+    const int S = s_scale, W = s_wide_w * S;
+    int y0 = disp_y * S, h = disp_h * S;
+    if (y0 < 0) y0 = 0;
+    if (y0 + h > VRAM_H * S) h = VRAM_H * S - y0;
+    if (h <= 0) return;
+    VkBuffer buf; VkDeviceMemory mem; void *map;
+    if (!make_staging((VkDeviceSize)W * h * 4, &buf, &mem, &map)) return;
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy rc = {0};
+    rc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    rc.imageSubresource.layerCount = 1;
+    rc.imageOffset.y = y0;
+    rc.imageExtent.width = (uint32_t)W; rc.imageExtent.height = (uint32_t)h; rc.imageExtent.depth = 1;
+    p_vkCmdCopyImageToBuffer(cb, s_wide_img[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rc);
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    end_oneshot(cb);
+    gpu_sync();
+    snprintf(path, sizeof path, "%s/seq_%03d.raw", dir, serial++);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        const int hdr[4] = { W, h, i, disp_y };
+        fwrite(hdr, sizeof hdr, 1, f); fwrite(map, 4, (size_t)W * h, f); fclose(f);
+    }
+    free_staging(buf, mem);
+    left--;
+}
+
 static int present_wide_surf(int i, int disp_y, int disp_h, int linear) {
     flush_cpu_upload();
     flush_tex_batch(); flush_geometry(); gpu_sync();
+    seq_dump(i, disp_y, disp_h);
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
     if (!acquire_present(&sc, &cb, &idx, &fr)) return 1;  /* frame skipped/recreated */
 
@@ -4991,7 +5041,19 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
     const int op = c->op, nv = kFgPos[op].nv;
     s_fg_bd_bits = c->bd;
     s_pc_valid = 0; s_pq_valid = 0;
-    const int bdrop = fg_is_backdrop(c);
+    int bdrop = fg_is_backdrop(c);
+    if (bdrop && p && p->op == op &&
+        !(op == FG_TT || op == FG_STT || op == FG_TR || op == FG_TRS)) {
+        /* An untextured shape that sits at exactly the same place in both
+         * frames is fixed to the screen (cutscene letterbox bars, fades), not
+         * part of the scrolling layer: it must not take the layer's shift. */
+        int same = 1;
+        for (int i = 0; i < nv && same; i++) {
+            const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
+            if (c->a[xi] - c->offx != p->a[xi] - p->offx || c->a[yi] - c->offy != p->a[yi] - p->offy) same = 0;
+        }
+        if (same) bdrop = 0;
+    }
     if (bdrop || c->ovr) {
         /* Rigid shift: back from where it is now by the part of the frame's
          * motion that has not happened yet at time t. */
