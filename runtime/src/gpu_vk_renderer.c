@@ -4641,8 +4641,9 @@ enum { FG_SEMI, FG_MASK, FG_TWIN, FG_MOD, FG_DA, FG_OFF, FG_VIEW, FG_WSET, FG_WD
 #define FG_BASE 0x40000000     /* wide-surface key of the generated picture */
 
 typedef struct {
-    uint8_t op, pc_valid, pq_valid, used, bd;
+    uint8_t op, pc_valid, pq_valid, used, bd, ovr;   /* ovr: move by (sdx, sdy) instead of toward the pair */
     int16_t offx, offy;
+    float sdx, sdy;
     int32_t a[20];
     float pcx[3], pcy[3], pq[3];
     uint32_t key;
@@ -4734,7 +4735,7 @@ static FgCmd *fg_rec(int op) {
     if (l->n == 0) fg_state_get(&l->init);
     if (l->n >= FG_MAX_CMDS) { l->overflow = 1; return NULL; }
     FgCmd *c = &l->c[l->n++];
-    c->op = (uint8_t)op; c->used = 0; c->pc_valid = 0; c->pq_valid = 0;
+    c->op = (uint8_t)op; c->used = 0; c->pc_valid = 0; c->pq_valid = 0; c->ovr = 0;
     c->offx = (int16_t)s_off_x; c->offy = (int16_t)s_off_y;
     c->key = 0; c->next = -1;
     return c;
@@ -4886,6 +4887,69 @@ static int fg_match(FgList *prev, FgList *cur) {
     return matched;
 }
 
+/* Motion consistency. World geometry repeats too (a wall is many quads with
+ * the same texture cut-out), so nearest-position pairing can pick the
+ * neighbouring tile: that one primitive then travels a tile's width in the
+ * generated picture and leaves a hole. Primitives that draw with the same key
+ * move together, so within each key group a member whose frame-to-frame
+ * motion differs from the group's median (or that found no pair) takes the
+ * median instead. Small groups are checked against the whole frame's median. */
+static int fg_is_backdrop(const FgCmd *c);
+static int fg_cmp_float(const void *a, const void *b);
+static float fg_median(float *v, int n) { qsort(v, (size_t)n, sizeof(float), fg_cmp_float); return v[n / 2]; }
+static void fg_regularize(const FgList *prev, FgList *cur) {
+    static float gx[FG_MAX_CMDS], gy[FG_MAX_CMDS];
+    static int   chain[FG_MAX_CMDS], head[FG_HASH], member[1024];
+    static float mx[1024], my[1024];
+    int gn = 0;
+    for (int i = 0; i < FG_HASH; i++) head[i] = -1;
+    for (int i = cur->n - 1; i >= 0; i--) {
+        FgCmd *c = &cur->c[i];
+        chain[i] = -1; c->ovr = 0;
+        if (c->op < FG_FIRST_PRIM || fg_is_backdrop(c)) continue;
+        const uint32_t b = c->key & (FG_HASH - 1);
+        chain[i] = head[b]; head[b] = i;
+        if (c->used && c->next >= 0) {
+            float cx, cy, px, py;
+            fg_centre(c, &cx, &cy); fg_centre(&prev->c[c->next], &px, &py);
+            c->sdx = cx - px; c->sdy = cy - py;
+            gx[gn] = c->sdx; gy[gn] = c->sdy; gn++;
+        }
+    }
+    if (gn < 8) return;
+    const float gmx = fg_median(gx, gn), gmy = fg_median(gy, gn);
+    for (int b = 0; b < FG_HASH; b++) {
+        for (int i = head[b]; i >= 0; i = chain[i]) {
+            FgCmd *c = &cur->c[i];
+            if (c->ovr & 2) continue;                 /* already handled with its group */
+            int n = 0, m = 0;
+            for (int j = i; j >= 0 && n < 1024; j = chain[j]) {
+                FgCmd *d = &cur->c[j];
+                if (d->key != c->key || d->op != c->op || (d->ovr & 2)) continue;
+                d->ovr |= 2; member[n++] = j;
+                if (d->used && d->next >= 0) { mx[m] = d->sdx; my[m] = d->sdy; m++; }
+            }
+            float rx = gmx, ry = gmy, tolx = 32.0f, toly = 32.0f;
+            if (m >= 3) {
+                /* Tolerance from the group's own spread (median absolute
+                 * deviation): perspective and rotation make honest motion
+                 * vary across a wall; a wrong pairing is a tile's width out. */
+                rx = fg_median(mx, m); ry = fg_median(my, m);
+                for (int k = 0; k < m; k++) { mx[k] = fabsf(mx[k] - rx); my[k] = fabsf(my[k] - ry); }
+                tolx = 6.0f + 4.0f * fg_median(mx, m); toly = 6.0f + 4.0f * fg_median(my, m);
+            }
+            for (int k = 0; k < n; k++) {
+                FgCmd *d = &cur->c[member[k]];
+                const int paired = d->used && d->next >= 0;
+                if (paired && fabsf(d->sdx - rx) <= tolx && fabsf(d->sdy - ry) <= toly) continue;
+                if (!paired && m < 3) continue;       /* a lone new primitive: draw it where it is */
+                d->sdx = rx; d->sdy = ry; d->ovr |= 1;
+            }
+        }
+    }
+    for (int i = 0; i < cur->n; i++) cur->c[i].ovr &= 1;
+}
+
 /* The 2D backdrop (sky/water tile grids) moves as one rigid layer, and its
  * tiles repeat, so pairing them one by one by nearest position picks wrong
  * neighbours: tiles jumped and left holes in the generated picture. Backdrop
@@ -4927,11 +4991,12 @@ static void fg_emit(const FgCmd *c, const FgCmd *p) {
     const int op = c->op, nv = kFgPos[op].nv;
     s_fg_bd_bits = c->bd;
     s_pc_valid = 0; s_pq_valid = 0;
-    if (fg_is_backdrop(c)) {
-        /* Rigid layer shift: back from where it is now by the part of the
-         * frame's motion that has not happened yet at time t. */
-        const float bx = s_fg_bd_have ? s_fg_bd_dx * (1.0f - s_fg_t) : 0.0f;
-        const float by = s_fg_bd_have ? s_fg_bd_dy * (1.0f - s_fg_t) : 0.0f;
+    const int bdrop = fg_is_backdrop(c);
+    if (bdrop || c->ovr) {
+        /* Rigid shift: back from where it is now by the part of the frame's
+         * motion that has not happened yet at time t. */
+        const float bx = (bdrop ? (s_fg_bd_have ? s_fg_bd_dx : 0.0f) : c->sdx) * (1.0f - s_fg_t);
+        const float by = (bdrop ? (s_fg_bd_have ? s_fg_bd_dy : 0.0f) : c->sdy) * (1.0f - s_fg_t);
         if (nv == 3) {
             s_pq_valid = c->pq_valid;
             for (int i = 0; i < 3; i++) {
@@ -5079,6 +5144,7 @@ void vk_renderer_display_flip(void) {
     if (s_wide_w > 0 && !cur->overflow && !prev->overflow &&
         cur->wide_prims >= 24 && prev->wide_prims >= 24) {
         const int matched = fg_match(prev, cur);
+        fg_regularize(prev, cur);
         s_fg_stat_prims += (unsigned)cur->prims; s_fg_stat_matched += (unsigned)matched;
         const int mode = fg_enabled();
         const int want = (mode >= 2 && fg_120_ok()) ? (mode == 2 ? 2 : 3) : 1;
