@@ -306,7 +306,11 @@ static VkFormat        s_ds_format;
  * separateDepthStencilLayouts is enabled (it is not). Stencil-only leaves the
  * depth half in UNDEFINED; on AMD (no D24S8 -> D32S8) depth and stencil share
  * compression metadata. */
-#define DS_ASPECT (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+/* Only the stencil is used (PSX mask bit). A stencil-only format is one byte
+ * per pixel instead of eight for depth32+stencil8, which matters at high
+ * internal resolutions and with MSAA. */
+static VkImageAspectFlags s_ds_aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+#define DS_ASPECT s_ds_aspect
 
 /* Scratch hr image for VRAM->VRAM copies (resolves overlap). */
 static VkImage         s_scratch_img;
@@ -494,6 +498,21 @@ static uint32_t perf_elapsed_us(uint64_t start) {
 }
 
 static unsigned s_flip_count;   /* GP1(05h) display flips = guest frames */
+/* The stencil mirrors the PSX mask bit and is only ever READ by draws with
+ * mask-check on. An opaque textured batch needs a second full shading pass
+ * just to set that bit for its STP texels; while the game has not drawn with
+ * mask-check for a while that pass is skipped (about half the fragment work
+ * of textured geometry). It resumes with the first mask-check draw and stays
+ * on for 600 frames after the last one. */
+static unsigned s_mask_check_flip;     /* flip of the last mask-check draw */
+static int      s_mask_check_ever;
+static int      s_stencil_fix_force = -1;
+static int stencil_fix_needed(void) {
+    if (s_stencil_fix_force < 0) { const char *e = getenv("PSX_VK_STENCIL_FIX"); s_stencil_fix_force = e ? (*e == '1') : 2; }
+    if (s_stencil_fix_force != 2) return s_stencil_fix_force;
+    return s_mask_check_ever && (s_flip_count - s_mask_check_flip) < 600u;
+}
+static unsigned s_stat_fix_on, s_stat_fix_off;
 /* Every 32 frames: re-classify the VRAM tiles; a change drops the memo. */
 static void hd_flip_tick(void) {
     if (!s_hd_ready) return;
@@ -501,7 +520,10 @@ static void hd_flip_tick(void) {
     int changed = 0;
     for (int ty = 0; ty < HD_TILE_H; ty++)
         for (int tx = 0; tx < HD_TILE_W; tx++) {
-            const uint8_t a = s_hd_wr_cnt[ty][tx] >= 12;
+            /* Hysteresis: animated at 12+ of 32 frames, static again only at
+             * 2 or fewer, so a tile near the threshold does not flip. */
+            const uint8_t c = s_hd_wr_cnt[ty][tx];
+            const uint8_t a = c >= 12 ? 1 : c <= 2 ? 0 : s_hd_anim[ty][tx];
             if (a != s_hd_anim[ty][tx]) { s_hd_anim[ty][tx] = a; changed = 1; }
             s_hd_wr_cnt[ty][tx] = 0;
         }
@@ -538,6 +560,9 @@ static void perf_snapshot_present(void) {
                 s_fg_120_off = 1;   /* presents are blocking: the display is not taking 120 */
                 fprintf(stdout, "psxrecomp: vulkan: 90/120 fps turned off, the display is not accepting pictures that fast\n");
             }
+            fprintf(stdout, "psxrecomp: vulkan: mask-bit pass %s (%u batches with, %u without)\n",
+                    stencil_fix_needed() ? "on" : "skipped", s_stat_fix_on, s_stat_fix_off);
+            s_stat_fix_on = s_stat_fix_off = 0;
             if (s_hd_ready && gpu_hd_textures_active())
                 fprintf(stdout, "psxrecomp: vulkan: HD textures per second: %.1f lookups (%.1f direct, %.1f assembled), "
                                 "%.1f uploads, %.1f invalidating writes; cache %u MB\n",
@@ -1228,6 +1253,14 @@ static int make_image(VkFormat fmt, int w, int h, VkImageUsageFlags usage,
 }
 
 static VkFormat choose_ds_format(void) {
+    {
+        const char *e = getenv("PSX_VK_STENCIL_ONLY");
+        VkFormatProperties fp; p_vkGetPhysicalDeviceFormatProperties(s_phys, VK_FORMAT_S8_UINT, &fp);
+        if ((!e || *e != '0') && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+            s_ds_aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+            return VK_FORMAT_S8_UINT;
+        }
+    }
     VkFormat cand[2] = { VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT };
     for (int i = 0; i < 2; i++) {
         VkFormatProperties fp; p_vkGetPhysicalDeviceFormatProperties(s_phys, cand[i], &fp);
@@ -3140,10 +3173,10 @@ static void vkb_set_scale(int scale) {
     /* The settings panel's Resolution row wins over the session's scale (it is
      * read once per run, so the value never changes under live images). */
     /* MSAA multiplies the widescreen surfaces' memory by the sample count. */
-    const int cap = touch_ui_msaa() >= 4 ? 4 : touch_ui_msaa() == 2 ? 5 : 6;
+    const int cap = touch_ui_msaa() >= 4 ? 4 : touch_ui_msaa() == 2 ? 5 : 8;
     if (scale > cap) scale = cap;
     const int user = touch_ui_resolution() > cap ? cap : touch_ui_resolution();
-    if (user >= 1 && user <= 6) {
+    if (user >= 1 && user <= 8) {
         if (s_scale != user) fprintf(stdout, "psxrecomp: vulkan: internal resolution %dx from the settings panel\n", user);
         s_scale = user;
         return;
@@ -3540,6 +3573,7 @@ typedef struct {
     GeoPush  gp;
     TexPush  tp;
     VkDescriptorSet hd_ds;
+    uint8_t stencil_fix;
 } WideRec;
 #define WQ_MAX 4096
 static WideRec s_wq[WQ_MAX];
@@ -3603,6 +3637,7 @@ static void pass_close(void) {
             tp.semipass = 0;
             p_vkCmdPushConstants(cb, s_pl_tex, TS, 0, sizeof tp, &tp);
             p_vkCmdDraw(cb, r->n, 1, r->base, 0);
+            if (!r->stencil_fix) continue;
             bind_masked_stencil_only(cb, 1, 0, r->check, 1);
         } else {
             bind_masked(cb, 1, 0, 0, r->check, r->mask);
@@ -3694,6 +3729,7 @@ static void geo_prim_begin(int is_line) {
     flush_cpu_upload();   /* pending CPU writes precede this prim (PS1 order) */
     flush_tex_batch();
     int semi = s_semi_en ? s_semi_mode : -1;
+    if (s_mask_check) { s_mask_check_ever = 1; s_mask_check_flip = s_flip_count; }
     const int gate = vk_bd_gate(0, is_line);
     if (s_vcount > 0 && (semi != s_geo_semi || s_mask_set != s_geo_mask || s_mask_check != s_geo_check ||
                          gate != s_geo_gate))
@@ -3861,7 +3897,11 @@ static void flush_tex_batch(void) {
     tp.shift = px_shift(); tp.xoff = 0.0f; tp.xhalf = 512.0f;
     tp.maskset = s_tb_mask; tp.filter = s_tb_filter;
     tp.twin[0] = s_tb_twin[0]; tp.twin[1] = s_tb_twin[1]; tp.twin[2] = s_tb_twin[2]; tp.twin[3] = s_tb_twin[3];
-    if (!s_fg_replay) {   /* canonical VRAM pass (skipped for a generated picture) */
+    const int fix = stencil_fix_needed();
+    if (fix) s_stat_fix_on++; else s_stat_fix_off++;
+    static int dbg_nocanon = -1;
+    if (dbg_nocanon < 0) { const char *e = getenv("PSX_VK_NO_CANON"); dbg_nocanon = e && *e == '1'; }
+    if (!s_fg_replay && !(dbg_nocanon && s_wide_cur >= 0)) {   /* canonical VRAM pass (skipped for a generated picture) */
     canon_pass_open(cb);
     {
         VkDescriptorSet sets[2] = { s_ds_tex, s_tb_hd_ds ? s_tb_hd_ds : s_hd_none_ds };
@@ -3882,10 +3922,12 @@ static void flush_tex_batch(void) {
         tp.semipass = 0;
         p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
         p_vkCmdDraw(cb, n, 1, base, 0);
-        bind_masked_stencil_only(cb, 1, 0, s_tb_check, 1);
-        tp.semipass = 2;
-        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
-        p_vkCmdDraw(cb, n, 1, base, 0);
+        if (fix) {
+            bind_masked_stencil_only(cb, 1, 0, s_tb_check, 1);
+            tp.semipass = 2;
+            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+            p_vkCmdDraw(cb, n, 1, base, 0);
+        }
     } else {
         /* SEMI batch: genuine two-pass — STP=0 texels opaque, STP=1 texels
          * blended per the PSX mode. Cross-prim order is kept by isolating
@@ -3904,7 +3946,7 @@ static void flush_tex_batch(void) {
     if (s_wide_cur >= 0) {                 /* native-wide mirror (queued) */
         WideRec *r = wq_push(1, semi, s_tb_check, s_tb_mask, base, n);
         wide_xform(s_tb_gate, &tp.xoff, &tp.xhalf);
-        r->tp = tp; r->hd_ds = s_tb_hd_ds;
+        r->tp = tp; r->hd_ds = s_tb_hd_ds; r->stencil_fix = (uint8_t)fix;
     }
     end_oneshot(cb);
     s_gpu_dirty = 1;
@@ -4267,6 +4309,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
             }
         }
     }
+    if (s_mask_check) { s_mask_check_ever = 1; s_mask_check_flip = s_flip_count; }
     int isolate = (semi >= 0);
     const int gate = vk_bd_gate(1, 0);
     if (s_tcount > 0 &&
@@ -4362,6 +4405,7 @@ static void vkb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,
 /* VRAM->VRAM copy: blit the source hr region to scratch (resolves overlap),
  * then blit scratch -> dest with STP/mask split. Mirrors the GL backend. */
 static void vkb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
+    if (s_mask_check) { s_mask_check_ever = 1; s_mask_check_flip = s_flip_count; }
     hd_memo_invalidate(dx & (VRAM_W - 1), dy & (VRAM_H - 1), (dx & (VRAM_W - 1)) + w - 1, (dy & (VRAM_H - 1)) + h - 1);
     if (!s_ctx_ok || w <= 0 || h <= 0) return;
     flush_cpu_upload();   /* the copy source may include pending CPU writes */

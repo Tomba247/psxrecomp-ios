@@ -101,7 +101,7 @@ static void cfg_load(void) {
         else if (sscanf(line, "tex_smooth=%d", &v) == 1) s_tex = v != 0;
         else if (sscanf(line, "textures=%d", &v) == 1) s_tex = v < 0 || v > 2 ? 2 : v;
         else if (sscanf(line, "msaa=%d", &v) == 1) s_aa = v < 0 || v > 2 ? 0 : v;
-        else if (sscanf(line, "resolution=%d", &v) == 1) s_res = v < 0 || v > 6 ? 0 : v;
+        else if (sscanf(line, "resolution=%d", &v) == 1) s_res = v < 0 || v > 8 ? 0 : v;
     }
     fclose(f);
 }
@@ -243,7 +243,7 @@ static void menu_tap(float x, float y) {
         case ROW_AA:      s_aa = (s_aa + 1) % 3; break;
         case ROW_FPS:     s_show_fps = !s_show_fps; break;
         case ROW_FIT:     s_fit = !s_fit; break;
-        case ROW_RES:     s_res = (s_res + 1) % 7; break;
+        case ROW_RES:     s_res = (s_res + 1) % 9; break;
         case ROW_TOUCH:   s_mode = (s_mode + 1) % 3; break;
         case ROW_OPACITY: s_opacity = (s_opacity + 1) % 3; break;
         case ROW_CLOSE:   s_menu_open = 0; break;
@@ -529,9 +529,9 @@ static void draw_menu(void) {
     static const char *const kOnOff[2] = { "Off", "On" };
     static const char *const kMode[3] = { "Auto", "Always", "Off" };
     static const char *const kOpac[3] = { "Low", "Medium", "High" };
-    static const char *const kRes[7] = { "Default", "1x", "2x", "3x", "4x", "5x", "6x" };
-    static const char *const kResNew[7] = { "Default (restart)", "1x (restart)", "2x (restart)", "3x (restart)",
-                                            "4x (restart)", "5x (restart)", "6x (restart)" };
+    static const char *const kRes[9] = { "Default", "1x", "2x", "3x", "4x", "5x", "6x", "7x", "8x" };
+    static const char *const kResNew[9] = { "Default (restart)", "1x (restart)", "2x (restart)", "3x (restart)",
+                                            "4x (restart)", "5x (restart)", "6x (restart)", "7x (restart)", "8x (restart)" };
     static const char *const kRate[4] = { "30 (original)", "60", "90", "120" };
     static const char *const kTex[3] = { "Sharp", "Smooth", "HD pack" };
     static const char *const kTexNew[3] = { "Sharp (restart)", "Smooth (restart)", "HD pack (restart)" };
