@@ -38,6 +38,8 @@ int  touch_ui_canvas(int sc_w, int sc_h, const uint32_t **px, int *w, int *h,
 void touch_ui_presented(void);
 /* 1 = stretch the picture over the whole screen instead of letterboxing. */
 int  touch_ui_fit_screen(void);
+/* 1 = generate in-between pictures for 60 fps (Vulkan frame generation). */
+int  touch_ui_framegen(void);
 
 #ifdef __cplusplus
 }

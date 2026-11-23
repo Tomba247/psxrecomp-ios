@@ -49,6 +49,7 @@ void vk_renderer_sync_cpu(void){}
 void vk_renderer_restage_vram_after_savestate(void){}
 void vk_renderer_set_present_mode(int m){(void)m;}
 void vk_renderer_set_display_aspect(int n,int d){(void)n;(void)d;}
+void vk_renderer_display_flip(void){}
 int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
 const GpuRenderBackend *vk_backend_get(void) { return 0; }
 
@@ -332,6 +333,12 @@ static int            s_wide_w = 0;        /* wide width (native px); 0 = disabl
 static int            s_wide_offset = 0;   /* centering OFFSET (native px) */
 static int            s_wide_cur = -1;     /* active mirror surface index, -1 = none */
 static int            s_wide_cur_base = 0;
+/* Frame generation (see the fg_* block): while s_fg_replay is set the draw
+ * paths render ONLY the wide mirror pass, into surface s_fg_surf. */
+static int            s_fg_replay = 0;
+static int            s_fg_surf = -1;
+static int            s_fg_hold = 0;       /* a generated picture waits for the next present */
+static uint32_t       s_fg_hold_stamp = 0;
 static void wide_free_all(void);           /* defined with the wide helpers below */
 
 static VkSampler       s_samp;
@@ -2342,6 +2349,11 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     for (int k = 0; k < VK_WIDE_MAX_SURF; k++)
         if (s_wide_img[k] && s_wide_base[k] == disp_x) { i = k; break; }
     if (i < 0) return 0;
+    if (s_fg_hold) {   /* show the generated in-between picture first */
+        s_fg_hold = 0;
+        if (s_fg_surf >= 0 && s_wide_img[s_fg_surf] && s_present_idx - s_fg_hold_stamp <= 2)
+            i = s_fg_surf;
+    }
     flush_cpu_upload();
     flush_tex_batch(); flush_geometry(); gpu_sync();
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
@@ -3060,6 +3072,7 @@ static void wide_free_all(void) {
         s_wide_base[i] = -1;
     }
     s_wide_cur = -1;
+    s_fg_surf = -1; s_fg_hold = 0;
 }
 
 /* Find (or lazily create) the wide surface for base_x. Returns the surface
@@ -3069,6 +3082,7 @@ static void wide_free_all(void) {
  * pass expects (color/DS ATTACHMENT_OPTIMAL). */
 static int wide_surf_for(int base_x) {
     if (s_wide_w <= 0 || !s_ready) return -1;
+    if (s_fg_replay && s_fg_surf >= 0) return s_fg_surf;   /* generated picture */
     for (int i = 0; i < VK_WIDE_MAX_SURF; i++)
         if (s_wide_img[i] && s_wide_base[i] == base_x) return i;
     for (int i = 0; i < VK_WIDE_MAX_SURF; i++) {
@@ -3174,16 +3188,18 @@ static void flush_geometry(void) {
     s_vbase += n; s_vcount = 0;   /* consumed region stays untouched until gpu_sync */
     int semi = s_geo_semi, blend = (semi < 0) ? 0 : (semi + 1);
     VkCommandBuffer cb = begin_oneshot();
-    vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    begin_geo_pass(cb);
-    set_vp_scissor(cb);
-    bind_masked(cb, 0, 0, blend, s_geo_check, s_geo_mask);
-    GeoPush gp = { px_shift(), 0.0f, 512.0f };
-    p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof gp, &gp);
     VkDeviceSize off = 0;
     p_vkCmdBindVertexBuffers(cb, 0, 1, &s_vbuf, &off);
-    p_vkCmdDraw(cb, n, 1, base, 0);
-    p_vkCmdEndRenderPass(cb);
+    if (!s_fg_replay) {
+        vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        begin_geo_pass(cb);
+        set_vp_scissor(cb);
+        bind_masked(cb, 0, 0, blend, s_geo_check, s_geo_mask);
+        GeoPush gp = { px_shift(), 0.0f, 512.0f };
+        p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof gp, &gp);
+        p_vkCmdDraw(cb, n, 1, base, 0);
+        p_vkCmdEndRenderPass(cb);
+    }
     if (s_wide_cur >= 0 && !s_geo_mirror_suppress) {   /* native-wide mirror pass (same CB) */
         wide_pass_begin(cb);
         bind_masked(cb, 0, 0, blend, s_geo_check, s_geo_mask);
@@ -3195,6 +3211,7 @@ static void flush_geometry(void) {
     s_geo_mirror_suppress = 0;
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
+    if (s_fg_replay) { rect_clear(&s_geo_bbox); return; }   /* VRAM untouched */
     if (s_geo_bbox.set) {
         int x0 = s_geo_bbox.x0 < s_da_x1 ? s_da_x1 : s_geo_bbox.x0;
         int y0 = s_geo_bbox.y0 < s_da_y1 ? s_da_y1 : s_geo_bbox.y0;
@@ -3395,9 +3412,6 @@ static void flush_tex_batch(void) {
     int semi = s_tb_semi, blend = (semi < 0) ? 0 : (semi + 1);
     VkCommandBuffer cb = begin_oneshot();
     img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    begin_geo_pass(cb);
-    set_vp_scissor(cb);
     p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 1, &s_ds_tex, 0, NULL);
     VkDeviceSize off = 0;
     p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
@@ -3405,6 +3419,10 @@ static void flush_tex_batch(void) {
     tp.shift = px_shift(); tp.xoff = 0.0f; tp.xhalf = 512.0f;
     tp.maskset = s_tb_mask; tp.filter = s_tb_filter;
     tp.twin[0] = s_tb_twin[0]; tp.twin[1] = s_tb_twin[1]; tp.twin[2] = s_tb_twin[2]; tp.twin[3] = s_tb_twin[3];
+    if (!s_fg_replay) {   /* canonical VRAM pass (skipped for a generated picture) */
+    vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    begin_geo_pass(cb);
+    set_vp_scissor(cb);
     if (semi < 0) {
         /* OPAQUE batch: the STP bit does not gate COLOUR (every texel is
          * opaque), so colour draws in ONE ordered pass over all texels —
@@ -3437,6 +3455,7 @@ static void flush_tex_batch(void) {
         p_vkCmdDraw(cb, n, 1, base, 0);
     }
     p_vkCmdEndRenderPass(cb);
+    }   /* !s_fg_replay */
     if (s_wide_cur >= 0) {                 /* native-wide mirror pass (same CB) */
         wide_pass_begin(cb);
         tp.xoff = (float)wide_dx(); tp.xhalf = (float)s_wide_w / 2.0f;
@@ -3535,6 +3554,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
         if (ys[i] < by0) by0 = ys[i]; if (ys[i] > by1) by1 = ys[i];
     }
     s_tcount += 3;
+    if (s_fg_replay) return;   /* generated picture: no VRAM dirty tracking */
     /* A sub-pixel-corrected vertex lies in [int, int+1) of the integer position
      * it was rounded from, so widen the readback rect by one pixel. */
     if (s_pc_valid) { bx1 += 1; by1 += 1; }
@@ -3798,6 +3818,410 @@ static int vkb_render_wide_display(uint32_t *out, int pitch, int base_x,
     return count;
 }
 
+/* ---- 60 fps frame generation (draw-list interpolation) ------------------- */
+/* Titles that draw a new picture every second vblank (30 fps) get one
+ * generated picture in between. Every draw call of a guest frame is recorded;
+ * at the display flip (GP1 05h) the finished list N is replayed with each
+ * primitive moved halfway back toward its match in list N-1, into a private
+ * wide surface. The next present shows that surface, the one after shows the
+ * real frame N, so real frames are delayed by one vblank.
+ *
+ * Primitives are matched by what they draw (kind, texture page, CLUT, uvs),
+ * nearest first; an unmatched primitive is drawn where frame N has it. When
+ * too little matches (a camera cut) no picture is generated.
+ *
+ * Guest-visible state is never touched: the replay draws only the wide mirror
+ * pass (s_fg_replay), never the VRAM image or the CPU mirror. It therefore
+ * works only while the native-wide target is active (3D scenes in widescreen).
+ */
+enum { FG_SEMI, FG_MASK, FG_TWIN, FG_MOD, FG_DA, FG_OFF, FG_VIEW, FG_WSET, FG_WDIS,
+       FG_WCLR, FG_WCLRM,
+       FG_FT, FG_GT, FG_TT, FG_STT, FG_FR, FG_TR, FG_TRS, FG_LN, FG_SLN, FG_OPS };
+#define FG_FIRST_PRIM FG_FT
+#define FG_MAX_CMDS 24576
+#define FG_HASH 8192
+#define FG_BASE 0x40000000     /* wide-surface key of the generated picture */
+
+typedef struct {
+    uint8_t op, pc_valid, pq_valid, used;
+    int16_t offx, offy;
+    int32_t a[20];
+    float pcx[3], pcy[3], pq[3];
+    uint32_t key;
+    int32_t next;
+} FgCmd;
+
+typedef struct {
+    int semi_en, semi_mode, mask_set, mask_check;
+    int tw[4], mod[4], da[4], off[2], view[4];
+    int wide_on, wide_base;
+} FgState;
+
+typedef struct {
+    FgCmd *c;
+    int n, prims, wide_prims, overflow;
+    FgState init;
+} FgList;
+
+static FgList s_fg_list[2];
+static int s_fg_cur;                 /* index of the list being recorded */
+static int s_fg_on = -1;
+static int s_fg_head[FG_HASH];
+static unsigned s_fg_stat_flips, s_fg_stat_made, s_fg_stat_prims, s_fg_stat_matched;
+
+/* Vertex count and the a[] slots of each vertex's x and y, per op. */
+static const struct { int nv; int xi[3], yi[3]; } kFgPos[FG_OPS] = {
+    [FG_FT]  = { 3, { 0, 2, 4 },  { 1, 3, 5 } },
+    [FG_GT]  = { 3, { 0, 3, 6 },  { 1, 4, 7 } },
+    [FG_TT]  = { 3, { 0, 4, 8 },  { 1, 5, 9 } },
+    [FG_STT] = { 3, { 0, 5, 10 }, { 1, 6, 11 } },
+    [FG_FR]  = { 1, { 0 }, { 1 } },
+    [FG_TR]  = { 1, { 0 }, { 1 } },
+    [FG_TRS] = { 1, { 0 }, { 1 } },
+    [FG_LN]  = { 2, { 0, 2 }, { 1, 3 } },
+    [FG_SLN] = { 2, { 0, 3 }, { 1, 4 } },
+};
+static const int kFgArgs[FG_OPS] = {
+    [FG_FT] = 7, [FG_GT] = 9, [FG_TT] = 15, [FG_STT] = 19, [FG_FR] = 5,
+    [FG_TR] = 9, [FG_TRS] = 11, [FG_LN] = 5, [FG_SLN] = 6,
+};
+
+static int fg_enabled(void) {
+    if (s_fg_on < 0) {
+        const char *e = getenv("PSX_VK_FRAMEGEN");
+        s_fg_on = (e && *e) ? (*e != '0') : 2;   /* 2 = follow the settings panel */
+    }
+    return s_fg_on == 2 ? touch_ui_framegen() : s_fg_on;
+}
+
+static void fg_state_get(FgState *s) {
+    s->semi_en = s_semi_en; s->semi_mode = s_semi_mode;
+    s->mask_set = s_mask_set; s->mask_check = s_mask_check;
+    s->tw[0] = s_tw_mask_x; s->tw[1] = s_tw_mask_y; s->tw[2] = s_tw_off_x; s->tw[3] = s_tw_off_y;
+    s->mod[0] = s_mod_r; s->mod[1] = s_mod_g; s->mod[2] = s_mod_b; s->mod[3] = s_mod_raw;
+    s->da[0] = s_da_x1; s->da[1] = s_da_y1; s->da[2] = s_da_x2; s->da[3] = s_da_y2;
+    s->off[0] = s_off_x; s->off[1] = s_off_y;
+    s->view[0] = view_enabled; s->view[1] = view_shift;
+    s->view[2] = view_pad_left; s->view[3] = view_pad_right;
+    s->wide_on = s_wide_cur >= 0; s->wide_base = s_wide_cur_base;
+}
+
+/* Batches must be drained before this. */
+static void fg_state_set(const FgState *s) {
+    s_semi_en = s->semi_en; s_semi_mode = s->semi_mode;
+    s_mask_set = s->mask_set; s_mask_check = s->mask_check;
+    s_tw_mask_x = s->tw[0]; s_tw_mask_y = s->tw[1]; s_tw_off_x = s->tw[2]; s_tw_off_y = s->tw[3];
+    s_mod_r = s->mod[0]; s_mod_g = s->mod[1]; s_mod_b = s->mod[2]; s_mod_raw = s->mod[3];
+    s_da_x1 = s->da[0]; s_da_y1 = s->da[1]; s_da_x2 = s->da[2]; s_da_y2 = s->da[3];
+    s_off_x = s->off[0]; s_off_y = s->off[1];
+    view_enabled = s->view[0]; view_shift = s->view[1];
+    view_pad_left = s->view[2]; view_pad_right = s->view[3];
+}
+
+static void fg_reset(void) {
+    for (int i = 0; i < 2; i++) {
+        s_fg_list[i].n = s_fg_list[i].prims = s_fg_list[i].wide_prims = 0;
+        s_fg_list[i].overflow = 0;
+    }
+    s_fg_hold = 0;
+}
+
+static FgCmd *fg_rec(int op) {
+    if (s_fg_replay || !s_ready || !fg_enabled()) return NULL;
+    FgList *l = &s_fg_list[s_fg_cur];
+    if (!l->c) {
+        l->c = (FgCmd *)malloc(sizeof(FgCmd) * FG_MAX_CMDS);
+        if (!l->c) { s_fg_on = 0; return NULL; }
+    }
+    if (l->n == 0) fg_state_get(&l->init);
+    if (l->n >= FG_MAX_CMDS) { l->overflow = 1; return NULL; }
+    FgCmd *c = &l->c[l->n++];
+    c->op = (uint8_t)op; c->used = 0; c->pc_valid = 0; c->pq_valid = 0;
+    c->offx = (int16_t)s_off_x; c->offy = (int16_t)s_off_y;
+    c->key = 0; c->next = -1;
+    return c;
+}
+
+static void fg_rec_prim(int op, const int32_t *args) {
+    FgCmd *c = fg_rec(op);
+    if (!c) return;
+    const int n = kFgArgs[op];
+    memcpy(c->a, args, sizeof(int32_t) * (size_t)n);
+    if (kFgPos[op].nv == 3) {
+        c->pc_valid = (uint8_t)s_pc_valid; c->pq_valid = (uint8_t)s_pq_valid;
+        for (int i = 0; i < 3; i++) { c->pcx[i] = s_pc_x[i]; c->pcy[i] = s_pc_y[i]; c->pq[i] = s_pq[i]; }
+    }
+    /* Key: everything the primitive draws with, minus where it is. Lit colours
+     * of textured polygons change from frame to frame, so they stay out. */
+    uint32_t h = 2166136261u ^ (uint32_t)op;
+    for (int i = 0; i < n; i++) {
+        int skip = 0;
+        for (int v = 0; v < kFgPos[op].nv; v++)
+            if (i == kFgPos[op].xi[v] || i == kFgPos[op].yi[v]) skip = 1;
+        if (op == FG_STT && (i == 4 || i == 9 || i == 14)) skip = 1;
+        if (!skip) h = (h ^ (uint32_t)c->a[i]) * 16777619u;
+    }
+    c->key = h;
+    FgList *l = &s_fg_list[s_fg_cur];
+    l->prims++;
+    if (s_wide_cur >= 0) l->wide_prims++;
+}
+
+static void fg_rec_set(int op, int a0, int a1, int a2, int a3) {
+    FgCmd *c = fg_rec(op);
+    if (c) { c->a[0] = a0; c->a[1] = a1; c->a[2] = a2; c->a[3] = a3; }
+}
+
+/* Recording entry points (the backend vtable points here). */
+static void fgw_set_semi_transparency(int e, int m) { fg_rec_set(FG_SEMI, e, m, 0, 0); vkb_set_semi_transparency(e, m); }
+static void fgw_set_mask_bits(int s, int c) { fg_rec_set(FG_MASK, s, c, 0, 0); vkb_set_mask_bits(s, c); }
+static void fgw_set_texture_window(uint32_t raw) { fg_rec_set(FG_TWIN, (int)raw, 0, 0, 0); vkb_set_texture_window(raw); }
+static void fgw_set_color_modulation(int r, int g, int b, int raw) { fg_rec_set(FG_MOD, r, g, b, raw); vkb_set_color_modulation(r, g, b, raw); }
+static void fgw_set_draw_area(int x1, int y1, int x2, int y2) { fg_rec_set(FG_DA, x1, y1, x2, y2); vkb_set_draw_area(x1, y1, x2, y2); }
+static void fgw_set_draw_offset(int x, int y) { fg_rec_set(FG_OFF, x, y, 0, 0); vkb_set_draw_offset(x, y); }
+static void fgw_wide_set_view(int en, int shift, int pl, int pr) { fg_rec_set(FG_VIEW, en, shift, pl, pr); vkb_wide_set_view(en, shift, pl, pr); }
+static void fgw_wide_set_target(int base_x) { fg_rec_set(FG_WSET, base_x, 0, 0, 0); vkb_wide_set_target(base_x); }
+static void fgw_wide_disable_target(void) { fg_rec_set(FG_WDIS, 0, 0, 0, 0); vkb_wide_disable_target(); }
+static void fgw_wide_clear(int base_x, int y, int h, uint16_t color) { fg_rec_set(FG_WCLR, base_x, y, h, color); vkb_wide_clear(base_x, y, h, color); }
+static void fgw_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
+    FgCmd *c = fg_rec(FG_WCLRM);
+    if (c) { c->a[0] = base_x; c->a[1] = y; c->a[2] = h; c->a[3] = color; c->a[4] = sides; }
+    vkb_wide_clear_margins(base_x, y, h, color, sides);
+}
+static void fgw_wide_configure(int wide_w, int offset) {
+    if (wide_w != s_wide_w || offset != s_wide_offset) fg_reset();   /* surfaces are rebuilt */
+    vkb_wide_configure(wide_w, offset);
+}
+static void fgw_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t c) {
+    int32_t a[7] = { x0,y0,x1,y1,x2,y2,c };
+    fg_rec_prim(FG_FT, a);
+    vkb_draw_flat_triangle(x0,y0,x1,y1,x2,y2,c);
+}
+static void fgw_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int x2,int y2,uint16_t c2) {
+    int32_t a[9] = { x0,y0,c0,x1,y1,c1,x2,y2,c2 };
+    fg_rec_prim(FG_GT, a);
+    vkb_draw_gouraud_triangle(x0,y0,c0,x1,y1,c1,x2,y2,c2);
+}
+static void fgw_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,
+                                       int x2,int y2,int u2,int v2,uint16_t cx,uint16_t cy,uint16_t tp) {
+    int32_t a[15] = { x0,y0,u0,v0,x1,y1,u1,v1,x2,y2,u2,v2,cx,cy,tp };
+    fg_rec_prim(FG_TT, a);
+    vkb_draw_textured_triangle(x0,y0,u0,v0,x1,y1,u1,v1,x2,y2,u2,v2,cx,cy,tp);
+}
+static void fgw_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,
+                                              int x1,int y1,int u1,int v1,uint32_t c1,
+                                              int x2,int y2,int u2,int v2,uint32_t c2,
+                                              uint16_t cx,uint16_t cy,uint16_t tp,int raw) {
+    int32_t a[19] = { x0,y0,u0,v0,(int32_t)c0,x1,y1,u1,v1,(int32_t)c1,x2,y2,u2,v2,(int32_t)c2,cx,cy,tp,raw };
+    fg_rec_prim(FG_STT, a);
+    vkb_draw_shaded_textured_triangle(x0,y0,u0,v0,c0,x1,y1,u1,v1,c1,x2,y2,u2,v2,c2,cx,cy,tp,raw);
+}
+static void fgw_draw_flat_rect(int x,int y,int w,int h,uint16_t c) {
+    int32_t a[5] = { x,y,w,h,c };
+    fg_rec_prim(FG_FR, a);
+    vkb_draw_flat_rect(x,y,w,h,c);
+}
+static void fgw_draw_textured_rect(int x,int y,int w,int h,int u,int v,uint16_t cx,uint16_t cy,uint16_t tp) {
+    int32_t a[9] = { x,y,w,h,u,v,cx,cy,tp };
+    fg_rec_prim(FG_TR, a);
+    vkb_draw_textured_rect(x,y,w,h,u,v,cx,cy,tp);
+}
+static void fgw_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,int u1,int v1,
+                                          uint16_t cx,uint16_t cy,uint16_t tp) {
+    int32_t a[11] = { x,y,w,h,u0,v0,u1,v1,cx,cy,tp };
+    fg_rec_prim(FG_TRS, a);
+    vkb_draw_textured_rect_scaled(x,y,w,h,u0,v0,u1,v1,cx,cy,tp);
+}
+static void fgw_draw_line(int x0,int y0,int x1,int y1,uint16_t c) {
+    int32_t a[5] = { x0,y0,x1,y1,c };
+    fg_rec_prim(FG_LN, a);
+    vkb_draw_line(x0,y0,x1,y1,c);
+}
+static void fgw_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1) {
+    int32_t a[6] = { x0,y0,c0,x1,y1,c1 };
+    fg_rec_prim(FG_SLN, a);
+    vkb_draw_shaded_line(x0,y0,c0,x1,y1,c1);
+}
+
+/* Centre of a primitive relative to its draw offset (buffer-independent). */
+static void fg_centre(const FgCmd *c, float *cx, float *cy) {
+    const int nv = kFgPos[c->op].nv;
+    float x = 0, y = 0;
+    for (int i = 0; i < nv; i++) { x += (float)c->a[kFgPos[c->op].xi[i]]; y += (float)c->a[kFgPos[c->op].yi[i]]; }
+    *cx = x / (float)nv - (float)c->offx;
+    *cy = y / (float)nv - (float)c->offy;
+}
+
+/* Pair every primitive of `cur` with the nearest unused same-key primitive of
+ * `prev` (index in cur->c[i].next, -1 = none). Returns the number paired. */
+static int fg_match(FgList *prev, FgList *cur) {
+    for (int i = 0; i < FG_HASH; i++) s_fg_head[i] = -1;
+    for (int i = prev->n - 1; i >= 0; i--) {       /* chains end up in draw order */
+        FgCmd *p = &prev->c[i];
+        if (p->op < FG_FIRST_PRIM) continue;
+        p->used = 0;
+        const uint32_t b = p->key & (FG_HASH - 1);
+        p->next = s_fg_head[b]; s_fg_head[b] = i;
+    }
+    int matched = 0;
+    for (int i = 0; i < cur->n; i++) {
+        FgCmd *c = &cur->c[i];
+        if (c->op < FG_FIRST_PRIM) continue;
+        float cx, cy;
+        fg_centre(c, &cx, &cy);
+        int best = -1, steps = 0;
+        float bestd = 72.0f * 72.0f;               /* native px a primitive may move per frame */
+        for (int j = s_fg_head[c->key & (FG_HASH - 1)]; j >= 0 && steps < 256; j = prev->c[j].next, steps++) {
+            const FgCmd *p = &prev->c[j];
+            if (p->used || p->key != c->key || p->op != c->op) continue;
+            float px, py;
+            fg_centre(p, &px, &py);
+            const float d = (px - cx) * (px - cx) + (py - cy) * (py - cy);
+            if (d < bestd) { bestd = d; best = j; }
+        }
+        c->used = 0;
+        if (best >= 0) { prev->c[best].used = 1; c->used = 1; matched++; }
+        /* cur's own `next` is rebuilt when it becomes prev; reuse it as the pair. */
+        c->next = best;
+    }
+    return matched;
+}
+
+/* Draw `c` halfway toward its pair `p` (NULL = where it is). */
+static void fg_emit(const FgCmd *c, const FgCmd *p) {
+    int32_t a[20];
+    memcpy(a, c->a, sizeof a);
+    const int op = c->op, nv = kFgPos[op].nv;
+    s_pc_valid = 0; s_pq_valid = 0;
+    if (nv == 3) {
+        s_pq_valid = c->pq_valid;
+        for (int i = 0; i < 3; i++) s_pq[i] = c->pq[i];
+        if (p) {
+            for (int i = 0; i < 3; i++) {
+                const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
+                const float cx = c->pc_valid ? c->pcx[i] : (float)c->a[xi];
+                const float cy = c->pc_valid ? c->pcy[i] : (float)c->a[yi];
+                const float px = (p->pc_valid ? p->pcx[i] : (float)p->a[xi]) - (float)p->offx + (float)c->offx;
+                const float py = (p->pc_valid ? p->pcy[i] : (float)p->a[yi]) - (float)p->offy + (float)c->offy;
+                s_pc_x[i] = (cx + px) * 0.5f; s_pc_y[i] = (cy + py) * 0.5f;
+                a[xi] = (int32_t)floorf(s_pc_x[i]); a[yi] = (int32_t)floorf(s_pc_y[i]);
+            }
+            s_pc_valid = 1;
+        } else if (c->pc_valid) {
+            for (int i = 0; i < 3; i++) { s_pc_x[i] = c->pcx[i]; s_pc_y[i] = c->pcy[i]; }
+            s_pc_valid = 1;
+        }
+    } else if (p) {
+        for (int i = 0; i < nv; i++) {
+            const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
+            const int px = p->a[xi] - p->offx + c->offx, py = p->a[yi] - p->offy + c->offy;
+            a[xi] = (c->a[xi] + px) >> 1; a[yi] = (c->a[yi] + py) >> 1;
+        }
+    }
+    switch (op) {
+    case FG_FT:  vkb_draw_flat_triangle(a[0],a[1],a[2],a[3],a[4],a[5],(uint16_t)a[6]); break;
+    case FG_GT:  vkb_draw_gouraud_triangle(a[0],a[1],(uint16_t)a[2],a[3],a[4],(uint16_t)a[5],a[6],a[7],(uint16_t)a[8]); break;
+    case FG_TT:  vkb_draw_textured_triangle(a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],a[8],a[9],a[10],a[11],
+                                            (uint16_t)a[12],(uint16_t)a[13],(uint16_t)a[14]); break;
+    case FG_STT: vkb_draw_shaded_textured_triangle(a[0],a[1],a[2],a[3],(uint32_t)a[4],a[5],a[6],a[7],a[8],(uint32_t)a[9],
+                                                   a[10],a[11],a[12],a[13],(uint32_t)a[14],
+                                                   (uint16_t)a[15],(uint16_t)a[16],(uint16_t)a[17],a[18]); break;
+    case FG_FR:  vkb_draw_flat_rect(a[0],a[1],a[2],a[3],(uint16_t)a[4]); break;
+    case FG_TR:  vkb_draw_textured_rect(a[0],a[1],a[2],a[3],a[4],a[5],(uint16_t)a[6],(uint16_t)a[7],(uint16_t)a[8]); break;
+    case FG_TRS: vkb_draw_textured_rect_scaled(a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],
+                                               (uint16_t)a[8],(uint16_t)a[9],(uint16_t)a[10]); break;
+    case FG_LN:  vkb_draw_line(a[0],a[1],a[2],a[3],(uint16_t)a[4]); break;
+    case FG_SLN: vkb_draw_shaded_line(a[0],a[1],(uint16_t)a[2],a[3],a[4],(uint16_t)a[5]); break;
+    default: break;
+    }
+}
+
+/* Render the picture halfway between `prev` and `cur` into the private wide
+ * surface. Returns 1 when it was drawn. */
+static int fg_build(FgList *prev, FgList *cur) {
+    flush_cpu_upload();
+    flush_tex_batch(); flush_geometry();
+    if (s_fg_surf < 0 || !s_wide_img[s_fg_surf]) s_fg_surf = wide_surf_for(FG_BASE);
+    if (s_fg_surf < 0) return 0;
+
+    FgState live;
+    fg_state_get(&live);
+    const int live_cur = s_wide_cur;
+    const int live_pc = s_pc_valid, live_pq = s_pq_valid;
+    float live_pcx[3], live_pcy[3], live_q[3];
+    for (int i = 0; i < 3; i++) { live_pcx[i] = s_pc_x[i]; live_pcy[i] = s_pc_y[i]; live_q[i] = s_pq[i]; }
+
+    s_fg_replay = 1;
+    fg_state_set(&cur->init);
+    s_wide_cur = cur->init.wide_on ? s_fg_surf : -1;
+    s_wide_cur_base = cur->init.wide_base;
+    for (int i = 0; i < cur->n; i++) {
+        const FgCmd *c = &cur->c[i];
+        switch (c->op) {
+        case FG_SEMI: vkb_set_semi_transparency(c->a[0], c->a[1]); break;
+        case FG_MASK: vkb_set_mask_bits(c->a[0], c->a[1]); break;
+        case FG_TWIN: vkb_set_texture_window((uint32_t)c->a[0]); break;
+        case FG_MOD:  vkb_set_color_modulation(c->a[0], c->a[1], c->a[2], c->a[3]); break;
+        case FG_DA:   vkb_set_draw_area(c->a[0], c->a[1], c->a[2], c->a[3]); break;
+        case FG_OFF:  vkb_set_draw_offset(c->a[0], c->a[1]); break;
+        case FG_VIEW: vkb_wide_set_view(c->a[0], c->a[1], c->a[2], c->a[3]); break;
+        case FG_WSET:
+            flush_tex_batch(); flush_geometry();
+            s_wide_cur = s_fg_surf; s_wide_cur_base = c->a[0];
+            break;
+        case FG_WDIS:
+            flush_tex_batch(); flush_geometry();
+            s_wide_cur = -1;
+            break;
+        case FG_WCLR:  vkb_wide_clear(c->a[0], c->a[1], c->a[2], (uint16_t)c->a[3]); break;
+        case FG_WCLRM: vkb_wide_clear_margins(c->a[0], c->a[1], c->a[2], (uint16_t)c->a[3], c->a[4]); break;
+        default:
+            fg_emit(c, c->used && c->next >= 0 ? &prev->c[c->next] : NULL);
+            break;
+        }
+    }
+    flush_tex_batch(); flush_geometry();
+    s_fg_replay = 0;
+
+    fg_state_set(&live);
+    s_wide_cur = live_cur; s_wide_cur_base = live.wide_base;
+    s_pc_valid = live_pc; s_pq_valid = live_pq;
+    for (int i = 0; i < 3; i++) { s_pc_x[i] = live_pcx[i]; s_pc_y[i] = live_pcy[i]; s_pq[i] = live_q[i]; }
+    return 1;
+}
+
+/* GP1(05h): the guest switched the displayed buffer, so the list recorded
+ * since the last switch is a finished frame. */
+void vk_renderer_display_flip(void) {
+    if (!s_ctx_ok || !s_ready) return;
+    if (!fg_enabled()) { if (s_fg_list[0].n || s_fg_list[1].n) fg_reset(); return; }
+    FgList *cur = &s_fg_list[s_fg_cur], *prev = &s_fg_list[s_fg_cur ^ 1];
+    if (cur->n == 0) return;                      /* nothing drawn: not a frame boundary */
+    s_fg_stat_flips++;
+    s_fg_hold = 0;
+    if (s_wide_w > 0 && !cur->overflow && !prev->overflow &&
+        cur->wide_prims >= 24 && prev->wide_prims >= 24) {
+        const int matched = fg_match(prev, cur);
+        s_fg_stat_prims += (unsigned)cur->prims; s_fg_stat_matched += (unsigned)matched;
+        if (matched * 2 >= cur->prims && fg_build(prev, cur)) {
+            s_fg_hold = 1;
+            s_fg_hold_stamp = s_present_idx;
+            s_fg_stat_made++;
+        }
+    }
+    if (s_fg_stat_flips >= 300) {
+        fprintf(stdout, "psxrecomp: vulkan: frame generation: %u of %u frames got an in-between picture, %u%% of primitives matched (last frame: %d cmds, %d prims, %d wide; wide_w %d)\n",
+                s_fg_stat_made, s_fg_stat_flips,
+                s_fg_stat_prims ? (unsigned)((uint64_t)s_fg_stat_matched * 100u / s_fg_stat_prims) : 0u,
+                cur->n, cur->prims, cur->wide_prims, s_wide_w);
+        fflush(stdout);
+        s_fg_stat_flips = s_fg_stat_made = s_fg_stat_prims = s_fg_stat_matched = 0;
+    }
+    s_fg_cur ^= 1;                                /* cur becomes prev; old prev is reused */
+    s_fg_list[s_fg_cur].n = s_fg_list[s_fg_cur].prims = s_fg_list[s_fg_cur].wide_prims = 0;
+    s_fg_list[s_fg_cur].overflow = 0;
+}
+
 static const GpuRenderBackend VK_BACKEND = {
     .name                          = "vulkan",
     .init                          = vkb_init,
@@ -3805,38 +4229,38 @@ static const GpuRenderBackend VK_BACKEND = {
     .scale                         = vkb_scale,
     .set_texture_filter            = vkb_set_texture_filter,
     .texture_filter                = vkb_texture_filter,
-    .set_semi_transparency         = vkb_set_semi_transparency,
-    .set_mask_bits                 = vkb_set_mask_bits,
-    .set_texture_window            = vkb_set_texture_window,
-    .set_color_modulation          = vkb_set_color_modulation,
+    .set_semi_transparency         = fgw_set_semi_transparency,
+    .set_mask_bits                 = fgw_set_mask_bits,
+    .set_texture_window            = fgw_set_texture_window,
+    .set_color_modulation          = fgw_set_color_modulation,
     .set_precise_triangle          = vkb_set_precise_triangle,
     .set_perspective_triangle      = vkb_set_perspective_triangle,
     .fill_rect                     = vkb_fill_rect,
     .copy_rect                     = vkb_copy_rect,
-    .draw_flat_triangle            = vkb_draw_flat_triangle,
-    .draw_gouraud_triangle         = vkb_draw_gouraud_triangle,
-    .draw_textured_triangle        = vkb_draw_textured_triangle,
-    .draw_shaded_textured_triangle = vkb_draw_shaded_textured_triangle,
-    .draw_flat_rect                = vkb_draw_flat_rect,
-    .draw_textured_rect            = vkb_draw_textured_rect,
-    .draw_textured_rect_scaled     = vkb_draw_textured_rect_scaled,
-    .draw_line                     = vkb_draw_line,
-    .draw_shaded_line              = vkb_draw_shaded_line,
+    .draw_flat_triangle            = fgw_draw_flat_triangle,
+    .draw_gouraud_triangle         = fgw_draw_gouraud_triangle,
+    .draw_textured_triangle        = fgw_draw_textured_triangle,
+    .draw_shaded_textured_triangle = fgw_draw_shaded_textured_triangle,
+    .draw_flat_rect                = fgw_draw_flat_rect,
+    .draw_textured_rect            = fgw_draw_textured_rect,
+    .draw_textured_rect_scaled     = fgw_draw_textured_rect_scaled,
+    .draw_line                     = fgw_draw_line,
+    .draw_shaded_line              = fgw_draw_shaded_line,
     .render_display                = vkb_render_display,
     .render_display_hires          = vkb_render_display_hires,
     .vram_write                    = vkb_vram_write,
     .vram_read                     = vkb_vram_read,
     .vram_transfer_in              = vkb_vram_transfer_in,
     .vram_transfer_out             = vkb_vram_transfer_out,
-    .set_draw_area                 = vkb_set_draw_area,
+    .set_draw_area                 = fgw_set_draw_area,
     .get_draw_area                 = vkb_get_draw_area,
-    .set_draw_offset               = vkb_set_draw_offset,
-    .wide_configure                = vkb_wide_configure,
-    .wide_set_view = vkb_wide_set_view,
-    .wide_set_target               = vkb_wide_set_target,
-    .wide_disable_target           = vkb_wide_disable_target,
-    .wide_clear                    = vkb_wide_clear,
-    .wide_clear_margins            = vkb_wide_clear_margins,
+    .set_draw_offset               = fgw_set_draw_offset,
+    .wide_configure                = fgw_wide_configure,
+    .wide_set_view = fgw_wide_set_view,
+    .wide_set_target               = fgw_wide_set_target,
+    .wide_disable_target           = fgw_wide_disable_target,
+    .wide_clear                    = fgw_wide_clear,
+    .wide_clear_margins            = fgw_wide_clear_margins,
     .render_wide_display           = vkb_render_wide_display,
 };
 

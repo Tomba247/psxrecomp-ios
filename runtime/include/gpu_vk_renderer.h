@@ -54,6 +54,10 @@ void vk_renderer_restage_vram_after_savestate(void);
 void vk_renderer_set_present_mode(int mode);
 void vk_renderer_set_display_aspect(int num, int den);
 
+/* GP1(05h) changed the displayed buffer: a guest frame is complete. Drives
+ * 60 fps frame generation (in-between pictures); inert when that is off. */
+void vk_renderer_display_flip(void);
+
 #ifdef __cplusplus
 }
 #endif

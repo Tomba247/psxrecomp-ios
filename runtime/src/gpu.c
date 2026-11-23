@@ -10,6 +10,7 @@
  * Reference: PSX-SPX, page graphicsprocessingunitgpu (Graphics Processing Unit).
  */
 
+void vk_renderer_display_flip(void);   /* gpu_vk_renderer.c: frame generation */
 #include "gpu.h"
 #include "gpu_gl_renderer.h"
 #include "mod_texture_banks.h"
@@ -8368,6 +8369,9 @@ static void gp1_display_area_start(uint32_t val) {
     /* GP1(05h): Start of display area in VRAM
      * bits 0-9: X (in halfwords, 0-1023)
      * bits 10-18: Y (0-511) */
+    const int flip_x = (int)(val & 0x3FF), flip_y = (int)((val >> 10) & 0x1FF);
+    if (flip_x != (int)display_area_x || flip_y != (int)display_area_y)
+        vk_renderer_display_flip();   /* before the new frame's draws arrive */
     display_area_x = val & 0x3FF;
     display_area_y = (val >> 10) & 0x1FF;
     ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */
