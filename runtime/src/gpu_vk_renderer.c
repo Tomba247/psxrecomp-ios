@@ -274,6 +274,14 @@ static int        s_texfilter;
 /* ---- geometry / render targets ----------------------------------------- */
 static VkImageView     s_vram_view;       /* RGBA8 hr render target view */
 static VkRenderPass    s_rpass;           /* color (hr) + depth/stencil */
+/* MSAA (settings panel, applies at start): the native-wide surfaces -- what
+ * gameplay displays -- render into multisampled colour + stencil images and
+ * resolve into the single-sample surface at the end of every wide pass.
+ * Canonical VRAM stays single-sample (it is read back and sampled as data). */
+static int             s_msaa = 1;        /* 1, 2 or 4 samples */
+static VkRenderPass    s_rpass_ms;        /* MS colour + MS stencil + resolve */
+static int             s_pipe_ms;         /* pipelines bind for the MS pass */
+static int             s_make_samples = 1;
 static VkFramebuffer   s_fbo;
 
 /* Native R16_UINT raw VRAM mirror: the canonical 1555 bits, sampled in the
@@ -328,6 +336,9 @@ static VkDeviceMemory s_wide_ds_mem[VK_WIDE_MAX_SURF];
 static VkImageView    s_wide_ds_view[VK_WIDE_MAX_SURF];
 static VkFramebuffer  s_wide_fb[VK_WIDE_MAX_SURF];
 static VkImageLayout  s_wide_layout[VK_WIDE_MAX_SURF];
+static VkImage        s_wide_ms_img[VK_WIDE_MAX_SURF];    /* MSAA colour (s_msaa > 1) */
+static VkDeviceMemory s_wide_ms_mem[VK_WIDE_MAX_SURF];
+static VkImageView    s_wide_ms_view[VK_WIDE_MAX_SURF];
 static int            s_wide_base[VK_WIDE_MAX_SURF] = { -1, -1, -1, -1, -1, -1 };
 static int            s_wide_w = 0;        /* wide width (native px); 0 = disabled */
 static int            s_wide_offset = 0;   /* centering OFFSET (native px) */
@@ -442,7 +453,7 @@ static VkPipeline       s_pipe_pack;      /* compute */
 #define PIPE_STENCILS 3
 #define PIPE_CMASKS 2
 #define PIPE_CACHE_N (PIPE_PROGS * PIPE_TOPOS * PIPE_BLENDS * PIPE_STENCILS * PIPE_CMASKS)
-static VkPipeline s_pipe_cache[PIPE_CACHE_N];
+static VkPipeline s_pipe_cache[PIPE_CACHE_N * 2];   /* [single-sample | MSAA] */
 static VkShaderModule s_mod_geo_v, s_mod_geo_f, s_mod_tex_v, s_mod_tex_f, s_mod_blit_v, s_mod_blit_f;
 
 /* Untextured batch (flat/gouraud triangles, lines-as-quads, flat rects). */
@@ -1072,7 +1083,7 @@ static int make_image(VkFormat fmt, int w, int h, VkImageUsageFlags usage,
     VkImageCreateInfo ci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ci.imageType = VK_IMAGE_TYPE_2D; ci.format = fmt;
     ci.extent.width = w; ci.extent.height = h; ci.extent.depth = 1;
-    ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = (VkSampleCountFlagBits)s_make_samples;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL; ci.usage = usage;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (p_vkCreateImage(s_dev, &ci, NULL, img) != VK_SUCCESS) return vk_die("image create failed");
@@ -1203,6 +1214,29 @@ static int create_render_targets(void) {
     rpi.subpassCount = 1; rpi.pSubpasses = &sub;
     if (p_vkCreateRenderPass(s_dev, &rpi, NULL, &s_rpass) != VK_SUCCESS)
         return vk_die("render pass failed");
+    {
+        int want = touch_ui_msaa();
+        VkPhysicalDeviceProperties pr; p_vkGetPhysicalDeviceProperties(s_phys, &pr);
+        const VkSampleCountFlags okc = pr.limits.framebufferColorSampleCounts &
+                                       pr.limits.framebufferStencilSampleCounts;
+        while (want > 1 && !(okc & (VkSampleCountFlags)want)) want >>= 1;
+        s_msaa = want < 1 ? 1 : want;
+    }
+    if (s_msaa > 1) {
+        VkAttachmentDescription ma[3];
+        ma[0] = att[0]; ma[0].samples = (VkSampleCountFlagBits)s_msaa;
+        ma[1] = att[1]; ma[1].samples = (VkSampleCountFlagBits)s_msaa;
+        ma[2] = att[0]; ma[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        VkAttachmentReference rref = { 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkSubpassDescription msub = sub;
+        msub.pResolveAttachments = &rref;
+        VkRenderPassCreateInfo mrpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+        mrpi.attachmentCount = 3; mrpi.pAttachments = ma;
+        mrpi.subpassCount = 1; mrpi.pSubpasses = &msub;
+        if (p_vkCreateRenderPass(s_dev, &mrpi, NULL, &s_rpass_ms) != VK_SUCCESS) s_msaa = 1;
+    }
+    fprintf(stdout, "psxrecomp: vulkan: anti-aliasing %s (%d sample%s)\n",
+            s_msaa > 1 ? "MSAA on the widescreen picture" : "off", s_msaa, s_msaa > 1 ? "s" : "");
 
     VkImageView fbviews[2] = { s_vram_view, s_ds_view };
     VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
@@ -1328,6 +1362,8 @@ static int create_render_targets(void) {
 static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int cmask) {
     int key = (((prog * PIPE_TOPOS + topo) * PIPE_BLENDS + blend) * PIPE_STENCILS + stencil)
               * PIPE_CMASKS + cmask;
+    const int msp = s_pipe_ms && s_msaa > 1;
+    if (msp) key += PIPE_CACHE_N;
     if (s_pipe_cache[key]) return s_pipe_cache[key];
 
     VkShaderModule vs, fs; VkPipelineLayout layout;
@@ -1378,7 +1414,7 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = msp ? (VkSampleCountFlagBits)s_msaa : VK_SAMPLE_COUNT_1_BIT;
 
     /* Blend (PS1 modes). Alpha always replaced so the colour-alpha mask mirror
      * is exact (src ONE / dst ZERO). */
@@ -1433,7 +1469,7 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
     pi.pVertexInputState = &vin; pi.pInputAssemblyState = &ia;
     pi.pViewportState = &vp; pi.pRasterizationState = &rs;
     pi.pMultisampleState = &ms; pi.pDepthStencilState = &dss; pi.pColorBlendState = &cb;
-    pi.pDynamicState = &dy; pi.layout = layout; pi.renderPass = s_rpass;
+    pi.pDynamicState = &dy; pi.layout = layout; pi.renderPass = msp ? s_rpass_ms : s_rpass;
     VkPipeline p = VK_NULL_HANDLE;
     if (p_vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &pi, NULL, &p) != VK_SUCCESS) {
         vk_die("graphics pipeline create failed"); return VK_NULL_HANDLE;
@@ -1515,7 +1551,7 @@ void vk_renderer_shutdown(void) {
             staging_destroy(s_staging_cache[i].buf, s_staging_cache[i].mem);
     }
     wide_free_all();          /* native-wide surfaces (color + DS + framebuffers) */
-    for (int i = 0; i < PIPE_CACHE_N; i++)
+    for (int i = 0; i < PIPE_CACHE_N * 2; i++)
         if (s_pipe_cache[i]) p_vkDestroyPipeline(s_dev, s_pipe_cache[i], NULL);
     if (s_pipe_pack)   p_vkDestroyPipeline(s_dev, s_pipe_pack, NULL);
     if (s_mod_geo_v)   p_vkDestroyShaderModule(s_dev, s_mod_geo_v, NULL);
@@ -1535,6 +1571,7 @@ void vk_renderer_shutdown(void) {
     if (s_samp)     p_vkDestroySampler(s_dev, s_samp, NULL);
     if (s_fbo)         p_vkDestroyFramebuffer(s_dev, s_fbo, NULL);
     if (s_rpass)       p_vkDestroyRenderPass(s_dev, s_rpass, NULL);
+    if (s_rpass_ms)    { p_vkDestroyRenderPass(s_dev, s_rpass_ms, NULL); s_rpass_ms = VK_NULL_HANDLE; }
     if (s_vram_view)   p_vkDestroyImageView(s_dev, s_vram_view, NULL);
     if (s_raw_view)    p_vkDestroyImageView(s_dev, s_raw_view, NULL);
     if (s_ds_view)     p_vkDestroyImageView(s_dev, s_ds_view, NULL);
@@ -2576,6 +2613,7 @@ static void begin_geo_pass(VkCommandBuffer cb) {
         0, 0, NULL, 0, NULL, 1, &db);
     color_self_barrier(cb, s_vram_img);
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    s_pipe_ms = 0;
     rp.renderPass = s_rpass; rp.framebuffer = s_fbo;
     rp.renderArea.extent.width = VRAM_W * s_scale;
     rp.renderArea.extent.height = VRAM_H * s_scale;
@@ -2950,7 +2988,10 @@ static void vkb_init(uint16_t *vram) { s_vram = vram; s_cpu_dirty = 0; sw_render
 static void vkb_set_scale(int scale) {
     /* The settings panel's Resolution row wins over the session's scale (it is
      * read once per run, so the value never changes under live images). */
-    const int user = touch_ui_resolution();
+    /* MSAA multiplies the widescreen surfaces' memory by the sample count. */
+    const int cap = touch_ui_msaa() >= 4 ? 4 : touch_ui_msaa() == 2 ? 5 : 6;
+    if (scale > cap) scale = cap;
+    const int user = touch_ui_resolution() > cap ? cap : touch_ui_resolution();
     if (user >= 1 && user <= 6) {
         if (s_scale != user) fprintf(stdout, "psxrecomp: vulkan: internal resolution %dx from the settings panel\n", user);
         s_scale = user;
@@ -3182,6 +3223,9 @@ static void wide_free_all(void) {
         if (s_wide_fb[i])      { p_vkDestroyFramebuffer(s_dev, s_wide_fb[i], NULL); s_wide_fb[i] = VK_NULL_HANDLE; }
         if (s_wide_view[i])    { p_vkDestroyImageView(s_dev, s_wide_view[i], NULL); s_wide_view[i] = VK_NULL_HANDLE; }
         if (s_wide_img[i])     { p_vkDestroyImage(s_dev, s_wide_img[i], NULL); s_wide_img[i] = VK_NULL_HANDLE; }
+        if (s_wide_ms_view[i]) { p_vkDestroyImageView(s_dev, s_wide_ms_view[i], NULL); s_wide_ms_view[i] = VK_NULL_HANDLE; }
+        if (s_wide_ms_img[i])  { p_vkDestroyImage(s_dev, s_wide_ms_img[i], NULL); s_wide_ms_img[i] = VK_NULL_HANDLE; }
+        if (s_wide_ms_mem[i])  { p_vkFreeMemory(s_dev, s_wide_ms_mem[i], NULL); s_wide_ms_mem[i] = VK_NULL_HANDLE; }
         if (s_wide_mem[i])     { p_vkFreeMemory(s_dev, s_wide_mem[i], NULL); s_wide_mem[i] = VK_NULL_HANDLE; }
         if (s_wide_ds_view[i]) { p_vkDestroyImageView(s_dev, s_wide_ds_view[i], NULL); s_wide_ds_view[i] = VK_NULL_HANDLE; }
         if (s_wide_ds_img[i])  { p_vkDestroyImage(s_dev, s_wide_ds_img[i], NULL); s_wide_ds_img[i] = VK_NULL_HANDLE; }
@@ -3212,13 +3256,19 @@ static int wide_surf_for(int base_x) {
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT, &s_wide_img[i], &s_wide_mem[i], &s_wide_view[i]))
             return -1;
-        if (!make_image(s_ds_format, w, h,
+        const int msaa = s_msaa > 1;
+        s_make_samples = s_msaa;      /* stencil (and MS colour) match the pass */
+        int ok = make_image(s_ds_format, w, h,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        DS_ASPECT, &s_wide_ds_img[i], &s_wide_ds_mem[i], &s_wide_ds_view[i]))
-            return -1;
-        VkImageView views[2] = { s_wide_view[i], s_wide_ds_view[i] };
+                        DS_ASPECT, &s_wide_ds_img[i], &s_wide_ds_mem[i], &s_wide_ds_view[i]);
+        if (ok && msaa)
+            ok = make_image(VK_FORMAT_R8G8B8A8_UNORM, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT, &s_wide_ms_img[i], &s_wide_ms_mem[i], &s_wide_ms_view[i]);
+        s_make_samples = 1;
+        if (!ok) return -1;
+        VkImageView views[3] = { msaa ? s_wide_ms_view[i] : s_wide_view[i], s_wide_ds_view[i], s_wide_view[i] };
         VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
-        fi.renderPass = s_rpass; fi.attachmentCount = 2; fi.pAttachments = views;
+        fi.renderPass = msaa ? s_rpass_ms : s_rpass; fi.attachmentCount = msaa ? 3 : 2; fi.pAttachments = views;
         fi.width = (uint32_t)w; fi.height = (uint32_t)h; fi.layers = 1;
         if (p_vkCreateFramebuffer(s_dev, &fi, NULL, &s_wide_fb[i]) != VK_SUCCESS)
             return -1;
@@ -3231,22 +3281,45 @@ static int wide_surf_for(int base_x) {
         p_vkCmdClearColorImage(cb, s_wide_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &crng);
         img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         VkImageMemoryBarrier db = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        db.image = s_wide_ds_img[i]; db.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        db.image = s_wide_ds_img[i];
         db.subresourceRange.aspectMask = DS_ASPECT;
         db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
-        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               0, 0, NULL, 0, NULL, 1, &db);
-        VkClearDepthStencilValue dsv = { 0.0f, 0 };
-        VkImageSubresourceRange srng = { DS_ASPECT, 0, 1, 0, 1 };
-        p_vkCmdClearDepthStencilImage(cb, s_wide_ds_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dsv, 1, &srng);
-        db.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        db.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, NULL, 0, NULL, 1, &db);
+        if (!msaa) {
+            db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            db.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   0, 0, NULL, 0, NULL, 1, &db);
+            VkClearDepthStencilValue dsv = { 0.0f, 0 };
+            VkImageSubresourceRange srng = { DS_ASPECT, 0, 1, 0, 1 };
+            p_vkCmdClearDepthStencilImage(cb, s_wide_ds_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dsv, 1, &srng);
+            db.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            db.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, NULL, 0, NULL, 1, &db);
+        } else {
+            /* Multisampled images: park both in their attachment layouts, then
+             * clear them inside the MS pass (which also resolves the black). */
+            db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, NULL, 0, NULL, 1, &db);
+            VkImageLayout ml = VK_IMAGE_LAYOUT_UNDEFINED;
+            img_to(cb, s_wide_ms_img[i], &ml, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+            rp.renderPass = s_rpass_ms; rp.framebuffer = s_wide_fb[i];
+            rp.renderArea.extent.width = (uint32_t)w; rp.renderArea.extent.height = (uint32_t)h;
+            p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+            VkClearAttachment ca[2] = {0};
+            ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            ca[1].aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+            VkClearRect cr = { { { 0, 0 }, { (uint32_t)w, (uint32_t)h } }, 0, 1 };
+            p_vkCmdClearAttachments(cb, 2, ca, 1, &cr);
+            p_vkCmdEndRenderPass(cb);
+        }
         end_oneshot(cb);
         s_wide_base[i] = base_x;
         return i;
@@ -3280,8 +3353,10 @@ static void wide_pass_begin_surf(VkCommandBuffer cb, int i, int wide_w) {
         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         0, 0, NULL, 0, NULL, 1, &db);
     color_self_barrier(cb, s_wide_img[i]);
+    if (s_msaa > 1) color_self_barrier(cb, s_wide_ms_img[i]);
+    s_pipe_ms = s_msaa > 1;
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-    rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
+    rp.renderPass = s_msaa > 1 ? s_rpass_ms : s_rpass; rp.framebuffer = s_wide_fb[i];
     rp.renderArea.extent.width = (uint32_t)(wide_w * S);
     rp.renderArea.extent.height = (uint32_t)(VRAM_H * S);
     p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
@@ -3903,8 +3978,10 @@ static void vkb_wide_clear(int base_x, int y, int h, uint16_t color) {
     VkCommandBuffer cb = begin_oneshot();
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     color_self_barrier(cb, s_wide_img[i]);
+    if (s_msaa > 1) color_self_barrier(cb, s_wide_ms_img[i]);
+    s_pipe_ms = s_msaa > 1;
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-    rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
+    rp.renderPass = s_msaa > 1 ? s_rpass_ms : s_rpass; rp.framebuffer = s_wide_fb[i];
     rp.renderArea.extent.width = (uint32_t)(s_wide_w * S);
     rp.renderArea.extent.height = (uint32_t)H;
     p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
@@ -3941,8 +4018,10 @@ static void vkb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     VkCommandBuffer cb = begin_oneshot();
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     color_self_barrier(cb, s_wide_img[i]);
+    if (s_msaa > 1) color_self_barrier(cb, s_wide_ms_img[i]);
+    s_pipe_ms = s_msaa > 1;
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-    rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
+    rp.renderPass = s_msaa > 1 ? s_rpass_ms : s_rpass; rp.framebuffer = s_wide_fb[i];
     rp.renderArea.extent.width = (uint32_t)W;
     rp.renderArea.extent.height = (uint32_t)H;
     p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);

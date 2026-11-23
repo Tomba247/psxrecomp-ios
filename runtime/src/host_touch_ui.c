@@ -28,6 +28,7 @@ int  touch_ui_fit_screen(void) { return 0; }
 int  touch_ui_framegen(void) { return 0; }
 int  touch_ui_resolution(void) { return 0; }
 int  touch_ui_tex_smooth(void) { return 0; }
+int  touch_ui_msaa(void) { return 1; }
 
 #else
 
@@ -48,7 +49,7 @@ int  touch_ui_tex_smooth(void) { return 0; }
 #define B_SQUARE 0x8000u
 
 enum { MODE_AUTO = 0, MODE_ALWAYS = 1, MODE_OFF = 2 };
-enum { ROW_SMOOTH = 0, ROW_FPS, ROW_FIT, ROW_RES, ROW_TEX, ROW_TOUCH, ROW_OPACITY, ROW_CLOSE, ROW_COUNT };
+enum { ROW_SMOOTH = 0, ROW_FPS, ROW_FIT, ROW_RES, ROW_AA, ROW_TEX, ROW_TOUCH, ROW_OPACITY, ROW_CLOSE, ROW_COUNT };
 
 #define MAX_FINGERS 12
 typedef struct { int used; long long id; float x, y; int ui; } Finger;
@@ -68,6 +69,7 @@ static int s_menu_open;
 static int s_show_fps = 0, s_fit = 0, s_mode = MODE_AUTO, s_opacity = 1, s_smooth = 1;
 static int s_tex = 0;        /* polygon texture filter: 0 = sharp, 1 = smooth */
 static int s_res = 0;        /* internal resolution: 0 = the game default, else 1..6 x */
+static int s_aa = 0, s_aa_boot = -1;   /* MSAA: 0 off, 1 = 2x, 2 = 4x (applies at start) */
 static int s_res_boot = -1;  /* value this run started with */
 static int s_has_gamepad;
 static uint16_t s_buttons = 0xFFFFu;
@@ -94,6 +96,7 @@ static void cfg_load(void) {
         else if (sscanf(line, "smooth_60=%d", &v) == 1) s_smooth = v != 0;
         else if (sscanf(line, "frame_rate=%d", &v) == 1) s_smooth = v < 0 || v > 2 ? 1 : v;
         else if (sscanf(line, "tex_smooth=%d", &v) == 1) s_tex = v != 0;
+        else if (sscanf(line, "msaa=%d", &v) == 1) s_aa = v < 0 || v > 2 ? 0 : v;
         else if (sscanf(line, "resolution=%d", &v) == 1) s_res = v < 0 || v > 6 ? 0 : v;
     }
     fclose(f);
@@ -102,8 +105,8 @@ static void cfg_load(void) {
 static void cfg_save(void) {
     FILE *f = fopen(s_cfg_path, "w");
     if (!f) return;
-    fprintf(f, "show_fps=%d\nfit_screen=%d\ntouch_mode=%d\nopacity=%d\nframe_rate=%d\nresolution=%d\ntex_smooth=%d\n",
-            s_show_fps, s_fit, s_mode, s_opacity, s_smooth, s_res, s_tex);
+    fprintf(f, "show_fps=%d\nfit_screen=%d\ntouch_mode=%d\nopacity=%d\nframe_rate=%d\nresolution=%d\ntex_smooth=%d\nmsaa=%d\n",
+            s_show_fps, s_fit, s_mode, s_opacity, s_smooth, s_res, s_tex, s_aa);
     fclose(f);
 }
 
@@ -121,6 +124,7 @@ static void ui_init(void) {
     s_mx = SDL_CreateMutex();
     cfg_load();
     s_res_boot = s_res;
+    s_aa_boot = s_aa;
     s_has_gamepad = SDL_HasGamepad() ? 1 : 0;
     fprintf(stdout, "psxrecomp: touch ui on (fps %d, fit %d, touch mode %d, opacity %d, gamepad %d)\n",
             s_show_fps, s_fit, s_mode, s_opacity, s_has_gamepad);
@@ -131,6 +135,7 @@ int touch_ui_fit_screen(void) { ui_init(); return s_enabled && s_fit; }
 /* 0 = the game's own 30, 1 = 60 (one in-between picture), 2 = 120 (three). */
 int touch_ui_framegen(void) { ui_init(); return s_enabled ? s_smooth : 0; }
 int touch_ui_tex_smooth(void) { ui_init(); return s_enabled && s_tex; }
+int touch_ui_msaa(void) { ui_init(); return s_enabled ? (s_aa_boot == 2 ? 4 : s_aa_boot == 1 ? 2 : 1) : 1; }
 int touch_ui_resolution(void) { ui_init(); return s_enabled ? s_res_boot : 0; }
 
 /* ---- layout ------------------------------------------------------------- */
@@ -141,9 +146,9 @@ int touch_ui_resolution(void) { ui_init(); return s_enabled ? s_res_boot : 0; }
 #define COG_R   3.4f
 #define PANEL_HW 55.0f
 #define PANEL_Y0 9.0f
-#define ROW_Y0   (PANEL_Y0 + 12.0f)
-#define ROW_STEP 9.0f
-#define ROW_H    8.0f
+#define ROW_Y0   (PANEL_Y0 + 11.0f)
+#define ROW_STEP 8.4f
+#define ROW_H    7.4f
 
 static float wu(void) { return 100.0f * s_aspect; }
 
@@ -215,6 +220,7 @@ static void menu_tap(float x, float y) {
         switch (r) {
         case ROW_SMOOTH:  s_smooth = (s_smooth + 1) % 3; break;
         case ROW_TEX:     s_tex = !s_tex; break;
+        case ROW_AA:      s_aa = (s_aa + 1) % 3; break;
         case ROW_FPS:     s_show_fps = !s_show_fps; break;
         case ROW_FIT:     s_fit = !s_fit; break;
         case ROW_RES:     s_res = (s_res + 1) % 7; break;
@@ -497,7 +503,7 @@ static void draw_menu(void) {
     const int sc = text_scale();
     rrect(cx, pcy, PANEL_HW, phh, 4.0f, 0, 0x141A22, 0.93f);
     rrect(cx, pcy, PANEL_HW, phh, 4.0f, 0.4f, 0xFFFFFF, 0.35f);
-    text_mid(cx, PANEL_Y0 + 6.0f, "Settings", sc + 1, 0xFFFFFF, 1.0f);
+    text_mid(cx, PANEL_Y0 + 5.5f, "Settings", sc + 1, 0xFFFFFF, 1.0f);
 
     static const char *const kOnOff[2] = { "Off", "On" };
     static const char *const kMode[3] = { "Auto", "Always", "Off" };
@@ -507,10 +513,12 @@ static void draw_menu(void) {
                                             "4x (restart)", "5x (restart)", "6x (restart)" };
     static const char *const kRate[3] = { "30 (original)", "60", "120" };
     static const char *const kTex[2] = { "Sharp", "Smooth" };
-    const char *label[ROW_COUNT] = { "Frame rate", "Show FPS", "Fit to screen", "Resolution", "Textures", "Touch controls",
+    static const char *const kAa[3] = { "Off", "MSAA 2x", "MSAA 4x" };
+    static const char *const kAaNew[3] = { "Off (restart)", "MSAA 2x (restart)", "MSAA 4x (restart)" };
+    const char *label[ROW_COUNT] = { "Frame rate", "Show FPS", "Fit to screen", "Resolution", "Anti-aliasing", "Textures", "Touch controls",
                                      "Button opacity", "Close" };
     const char *value[ROW_COUNT] = { kRate[s_smooth], kOnOff[s_show_fps], kOnOff[s_fit],
-                                     s_res == s_res_boot ? kRes[s_res] : kResNew[s_res], kTex[s_tex], kMode[s_mode],
+                                     s_res == s_res_boot ? kRes[s_res] : kResNew[s_res], s_aa == s_aa_boot ? kAa[s_aa] : kAaNew[s_aa], kTex[s_tex], kMode[s_mode],
                                      kOpac[s_opacity], NULL };
     for (int r = 0; r < ROW_COUNT; r++) {
         const float cy = ROW_Y0 + ROW_STEP * r + ROW_H * 0.5f;
@@ -518,7 +526,7 @@ static void draw_menu(void) {
         if (!value[r]) { text_mid(cx, cy, label[r], sc, 0xFFFFFF, 1.0f); continue; }
         text_at(cx - PANEL_HW + 8.0f, cy, label[r], sc, 0xFFFFFF, 0.95f);
         const int on = (r == ROW_SMOOTH && s_smooth) || (r == ROW_FPS && s_show_fps) || (r == ROW_FIT && s_fit) ||
-                       (r == ROW_TOUCH && s_mode != MODE_OFF) || r == ROW_OPACITY || r == ROW_RES || (r == ROW_TEX && s_tex);
+                       (r == ROW_TOUCH && s_mode != MODE_OFF) || r == ROW_OPACITY || r == ROW_RES || (r == ROW_TEX && s_tex) || (r == ROW_AA && s_aa);
         text_right(cx + PANEL_HW - 8.0f, cy, value[r], sc, on ? 0xFFD060 : 0xA0A8B0, 1.0f);
     }
 }

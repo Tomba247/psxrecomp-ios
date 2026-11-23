@@ -45,6 +45,8 @@ int  touch_ui_framegen(void);
 int  touch_ui_resolution(void);
 /* 1 = bilinear filtering of polygon textures. */
 int  touch_ui_tex_smooth(void);
+/* MSAA sample count chosen in the panel for THIS run: 1, 2 or 4. */
+int  touch_ui_msaa(void);
 
 #ifdef __cplusplus
 }
