@@ -4913,9 +4913,12 @@ static void fg_centre(const FgCmd *c, float *cx, float *cy) {
     *cy = y / (float)nv - (float)c->offy;
 }
 
-/* Pair every primitive of `cur` with the nearest unused same-key primitive of
- * `prev` (index in cur->c[i].next, -1 = none). Returns the number paired. */
-static int fg_match(FgList *prev, FgList *cur) {
+/* Pair every primitive of `cur` with the unused same-key primitive of `prev`
+ * nearest to where it is expected to have been: its position now minus the
+ * frame's overall motion (gdx, gdy). Index in cur->c[i].next, -1 = none.
+ * Returns the number paired. */
+static int fg_is_backdrop(const FgCmd *c);
+static int fg_match(FgList *prev, FgList *cur, float gdx, float gdy) {
     for (int i = 0; i < FG_HASH; i++) s_fg_head[i] = -1;
     for (int i = prev->n - 1; i >= 0; i--) {       /* chains end up in draw order */
         FgCmd *p = &prev->c[i];
@@ -4930,6 +4933,7 @@ static int fg_match(FgList *prev, FgList *cur) {
         if (c->op < FG_FIRST_PRIM) continue;
         float cx, cy;
         fg_centre(c, &cx, &cy);
+        if (!fg_is_backdrop(c)) { cx -= gdx; cy -= gdy; }
         int best = -1, steps = 0;
         float bestd = 72.0f * 72.0f;               /* native px a primitive may move per frame */
         for (int j = s_fg_head[c->key & (FG_HASH - 1)]; j >= 0 && steps < 256; j = prev->c[j].next, steps++) {
@@ -5082,10 +5086,50 @@ static void fg_orphans(const FgList *prev, FgList *cur) {
         } else if (near_idx[i] >= 0) {
             const FgCmd *q = &cur->c[near_idx[i]];
             if (fabsf(q->sdx) <= 72.0f && fabsf(q->sdy) <= 72.0f) {
-                c->sdx = q->sdx; c->sdy = q->sdy; c->ovr = 1; s_fg_stat_orph_near++;
+                c->sdx = q->sdx; c->sdy = q->sdy; c->ovr = 1; c->vdx[0] = -12345.0f; s_fg_stat_orph_near++;
             }
         }
     }
+}
+
+/* Diagnostic (PSX_VK_FG_CSV=<file>): one line per frame saying how every
+ * primitive was placed in the in-between picture and how much screen each
+ * class covers. "loose" primitives are drawn where the new frame has them
+ * while their surroundings move: that is what shows as shaking. */
+static float fg_area(const FgCmd *c) {
+    const int nv = kFgPos[c->op].nv;
+    if (nv == 3) {
+        const float x0 = (float)c->a[kFgPos[c->op].xi[0]], y0 = (float)c->a[kFgPos[c->op].yi[0]];
+        const float x1 = (float)c->a[kFgPos[c->op].xi[1]], y1 = (float)c->a[kFgPos[c->op].yi[1]];
+        const float x2 = (float)c->a[kFgPos[c->op].xi[2]], y2 = (float)c->a[kFgPos[c->op].yi[2]];
+        const float a = fabsf((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)) * 0.5f;
+        return a > 76800.0f ? 76800.0f : a;
+    }
+    if (c->op == FG_FR || c->op == FG_TR || c->op == FG_TRS) return fabsf((float)c->a[2] * (float)c->a[3]);
+    return 0.0f;
+}
+static void fg_csv(const FgList *cur, int matched, int made) {
+    static FILE *f; static int tried;
+    if (!tried) { tried = 1; const char *e = getenv("PSX_VK_FG_CSV"); if (e && *e) { f = fopen(e, "w");
+        if (f) fprintf(f, "flip,made,prims,matched,median_dx,median_dy,n_pair,n_group,n_corner,n_near,n_loose,a_pair,a_group,a_corner,a_near,a_loose,loose_ops\n"); } }
+    if (!f) return;
+    int n[5] = {0}; float a[5] = {0}; unsigned ops = 0;
+    static float gx[FG_MAX_CMDS], gy[FG_MAX_CMDS]; int gn = 0;
+    for (int i = 0; i < cur->n; i++) {
+        const FgCmd *c = &cur->c[i];
+        if (c->op < FG_FIRST_PRIM || fg_is_backdrop(c)) continue;
+        const int paired = c->used && c->next >= 0;
+        int k;
+        if (c->ovr == 4) k = 2;
+        else if (c->ovr == 1) k = paired ? 1 : (c->vdx[0] == -12345.0f ? 3 : 1);
+        else if (paired) { k = 0; gx[gn] = c->sdx; gy[gn] = c->sdy; gn++; }
+        else { k = 4; ops |= 1u << (c->op & 31); }
+        n[k]++; a[k] += fg_area(c);
+    }
+    const float mdx = gn ? fg_median(gx, gn) : 0.0f, mdy = gn ? fg_median(gy, gn) : 0.0f;
+    fprintf(f, "%u,%d,%d,%d,%.1f,%.1f,%d,%d,%d,%d,%d,%.0f,%.0f,%.0f,%.0f,%.0f,%x\n", s_flip_count, made, cur->prims, matched, mdx, mdy,
+            n[0], n[1], n[2], n[3], n[4], a[0], a[1], a[2], a[3], a[4], ops);
+    if ((s_flip_count & 31) == 0) fflush(f);
 }
 
 /* The 2D backdrop (sky/water tile grids) moves as one rigid layer, and its
@@ -5305,7 +5349,27 @@ void vk_renderer_display_flip(void) {
     s_fg_hold = 0;
     if (s_wide_w > 0 && !cur->overflow && !prev->overflow &&
         cur->wide_prims >= 24 && prev->wide_prims >= 24) {
-        const int matched = fg_match(prev, cur);
+        int matched = fg_match(prev, cur, 0.0f, 0.0f);
+        {
+            /* Repeated surfaces (a wall or waterfall drawn as many pieces
+             * with one texture cut-out) pair with the wrong neighbour once
+             * the camera moves more than half a piece per frame. Most of the
+             * picture moves with the camera, so pair again around the motion
+             * the first pass found for the frame as a whole. */
+            static float mx[FG_MAX_CMDS], my[FG_MAX_CMDS];
+            int n = 0;
+            for (int i = 0; i < cur->n; i++) {
+                const FgCmd *c = &cur->c[i];
+                if (c->op < FG_FIRST_PRIM || !c->used || c->next < 0 || fg_is_backdrop(c)) continue;
+                float cx, cy, px, py;
+                fg_centre(c, &cx, &cy); fg_centre(&prev->c[c->next], &px, &py);
+                mx[n] = cx - px; my[n] = cy - py; n++;
+            }
+            if (n >= 16 && !getenv("PSX_VK_FG_NO_REMATCH")) {
+                const float gx = fg_median(mx, n), gy = fg_median(my, n);
+                if (fabsf(gx) > 1.0f || fabsf(gy) > 1.0f) matched = fg_match(prev, cur, gx, gy);
+            }
+        }
         fg_regularize(prev, cur);
         if (!getenv("PSX_VK_FG_NO_ORPHANS")) fg_orphans(prev, cur);
         s_fg_stat_prims += (unsigned)cur->prims; s_fg_stat_matched += (unsigned)matched;
@@ -5322,6 +5386,7 @@ void vk_renderer_display_flip(void) {
             s_fg_hold_stamp = s_present_idx;
             s_fg_stat_made++;
         }
+        fg_csv(cur, matched, made == want);
     }
     if (s_fg_stat_flips >= 300) {
         fprintf(stdout, "psxrecomp: vulkan: frame generation: %u of %u frames got an in-between picture, %u%% of primitives matched, %u orphans/frame (%u by corners, %u by neighbour) (last frame: %d cmds, %d prims, %d wide; wide_w %d)\n",
