@@ -882,6 +882,13 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     extern int psx_get_in_exception(void);
     extern uint64_t g_guest_store_count, g_mmio_access_count;
 
+    /* Hot path (every basic-block edge during gameplay): audited-only mode,
+     * detector already clean, PC not a declared wait. Every branch below would
+     * return without changing state, so skip their calls. */
+    if (s_idle_audited_only && !s_idle_pc && !s_idle_have_snap && !s_idle_edges &&
+        !*s_track && !idle_site_listed(check_pc))
+        return;
+
     /* A speculative replay must not clear or train the authoritative live idle
      * detector. Its clock/device view is transactional and cannot be skipped. */
     if (g_ls_replay_active) return;

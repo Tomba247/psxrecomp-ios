@@ -382,12 +382,14 @@ static uint32_t perf_elapsed_us(uint64_t start) {
 }
 
 static unsigned s_flip_count;   /* GP1(05h) display flips = guest frames */
+static uint64_t s_t_flush, s_t_close;   /* ticks in batch flushes / pass close */
 static void perf_snapshot_present(void) {
     s_perf_cur.present_idx = s_present_idx++;
     s_perf_cur.present_qpc = SDL_GetPerformanceCounter();
     {   /* One log line every 600 presents: is the host keeping up? */
-        static uint64_t t0, wait_us, acq_us, pres_us;
+        static uint64_t t0, wait_us, acq_us, pres_us, flushes, passes;
         static unsigned n, flips0;
+        flushes += s_perf_cur.tex_flushes + s_perf_cur.geo_flushes; passes += s_perf_cur.wide_passes;
         if (!t0) { t0 = s_perf_cur.present_qpc; flips0 = s_flip_count; }
         wait_us += s_perf_cur.wait_us; acq_us += s_perf_cur.acquire_us; pres_us += s_perf_cur.present_us;
         if (++n >= 600) {
@@ -397,7 +399,14 @@ static void perf_snapshot_present(void) {
                                 "acquire %.2f ms, present %.2f ms; scale %dx\n",
                         n / sec, (s_flip_count - flips0) / sec, wait_us / 1000.0 / n, acq_us / 1000.0 / n,
                         pres_us / 1000.0 / n, s_scale);
+            if (sec > 0.0) {
+                const double f = 1000.0 / (double)SDL_GetPerformanceFrequency() / n;
+                fprintf(stdout, "psxrecomp: vulkan: per picture: %.0f batches in %.1f wide passes, "
+                                "batch CPU %.2f ms, pass replay CPU %.2f ms\n",
+                        (double)flushes / n, (double)passes / n, s_t_flush * f, s_t_close * f);
+            }
             fflush(stdout);
+            s_t_flush = s_t_close = 0; flushes = passes = 0;
             t0 = s_perf_cur.present_qpc; flips0 = s_flip_count; n = 0; wait_us = acq_us = pres_us = 0;
         }
     }
@@ -621,7 +630,16 @@ static void vk_gpu_sync_internal(void);   /* drain queue + reclaim work pool/sta
  * operation. */
 static VkCommandBuffer s_work_cb;
 
-static VkCommandBuffer begin_oneshot(void) {
+/* Pass coalescing: consecutive batch flushes share ONE canonical render pass
+ * (left open in the work CB) and queue their native-wide mirror draws, which
+ * replay in one wide pass when the canonical pass closes. Every other GPU
+ * operation goes through begin_oneshot(), which closes the pass first, so
+ * recording order is unchanged. A render pass per flush cost a Metal encoder
+ * plus a full attachment load/store each on tile-based GPUs (iOS). */
+static void pass_close(void);
+
+/* The shared work CB without closing the coalesced pass (batch flushes). */
+static VkCommandBuffer work_cb(void) {
     s_perf_cur.oneshots++;
     if (s_work_cb) return s_work_cb;
     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
@@ -637,6 +655,11 @@ static VkCommandBuffer begin_oneshot(void) {
     return cb;
 }
 
+static VkCommandBuffer begin_oneshot(void) {
+    pass_close();
+    return work_cb();
+}
+
 /* Finish a logical operation but keep the shared command buffer open. */
 static void end_oneshot(VkCommandBuffer cb) {
     (void)cb;
@@ -645,6 +668,7 @@ static void end_oneshot(VkCommandBuffer cb) {
 
 static void flush_work(void) {
     if (!s_work_cb) return;
+    pass_close();
     p_vkEndCommandBuffer(s_work_cb);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
@@ -3086,6 +3110,7 @@ static int wide_dx(void) { return s_wide_offset + view_shift - s_wide_cur_base; 
 static void wide_free_all(void) {
     int any = 0;
     for (int i = 0; i < VK_WIDE_MAX_SURF; i++) any |= (s_wide_img[i] != VK_NULL_HANDLE);
+    pass_close();   /* queued mirror draws reference these surfaces */
     if (any) p_vkQueueWaitIdle(s_queue);   /* surfaces may be referenced in flight */
     for (int i = 0; i < VK_WIDE_MAX_SURF; i++) {
         if (s_wide_fb[i])      { p_vkDestroyFramebuffer(s_dev, s_wide_fb[i], NULL); s_wide_fb[i] = VK_NULL_HANDLE; }
@@ -3167,8 +3192,8 @@ static int wide_surf_for(int base_x) {
  * and the mirror scissor: FULL width X (the margins are the point) but the
  * DRAW-AREA Y band — native-wide only widens X; a full-height Y let draws bleed
  * across a vertical double-buffer band boundary (the GL band-flicker lesson). */
-static void wide_pass_begin(VkCommandBuffer cb) {
-    int i = s_wide_cur, S = s_scale;
+static void wide_pass_begin_surf(VkCommandBuffer cb, int i, int wide_w) {
+    int S = s_scale;
     s_perf_cur.wide_passes++;
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     /* Stencil self-barrier for the WIDE DS image (same hazard class as
@@ -3190,17 +3215,110 @@ static void wide_pass_begin(VkCommandBuffer cb) {
     color_self_barrier(cb, s_wide_img[i]);
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
-    rp.renderArea.extent.width = (uint32_t)(s_wide_w * S);
+    rp.renderArea.extent.width = (uint32_t)(wide_w * S);
     rp.renderArea.extent.height = (uint32_t)(VRAM_H * S);
     p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport vp = { 0.f, 0.f, (float)(s_wide_w * S), (float)(VRAM_H * S), 0.f, 1.f };
+    VkViewport vp = { 0.f, 0.f, (float)(wide_w * S), (float)(VRAM_H * S), 0.f, 1.f };
     p_vkCmdSetViewport(cb, 0, 1, &vp);
-    int y1 = s_da_y1 < 0 ? 0 : s_da_y1;
-    int y2 = s_da_y2 >= VRAM_H ? VRAM_H - 1 : s_da_y2;
+}
+static void wide_scissor(VkCommandBuffer cb, int wide_w, int da_y1, int da_y2, int pad_l, int pad_r) {
+    int S = s_scale;
+    int y1 = da_y1 < 0 ? 0 : da_y1;
+    int y2 = da_y2 >= VRAM_H ? VRAM_H - 1 : da_y2;
     int hh = y2 - y1 + 1; if (hh < 0) hh = 0;
-    VkRect2D sc = { { view_pad_left * S, y1 * S },
-        { (uint32_t)((s_wide_w - view_pad_left - view_pad_right) * S), (uint32_t)(hh * S) } };
+    VkRect2D sc = { { pad_l * S, y1 * S },
+        { (uint32_t)((wide_w - pad_l - pad_r) * S), (uint32_t)(hh * S) } };
     p_vkCmdSetScissor(cb, 0, 1, &sc);
+}
+static void wide_pass_begin(VkCommandBuffer cb) {
+    wide_pass_begin_surf(cb, s_wide_cur, s_wide_w);
+    wide_scissor(cb, s_wide_w, s_da_y1, s_da_y2, view_pad_left, view_pad_right);
+}
+
+/* ---- pass coalescing (see begin_oneshot) -------------------------------- */
+static int s_pass_open;          /* canonical VRAM pass open in the work CB */
+typedef struct {
+    uint8_t  tex, check, mask;
+    int8_t   semi;               /* -1 opaque, else PSX blend mode */
+    int16_t  surf, y1, y2, pad_l, pad_r;
+    int      wide_w;
+    uint32_t base, n;
+    GeoPush  gp;
+    TexPush  tp;
+} WideRec;
+#define WQ_MAX 4096
+static WideRec s_wq[WQ_MAX];
+static int s_wq_n;
+
+static void canon_pass_open(VkCommandBuffer cb) {
+    if (s_pass_open) return;
+    vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    begin_geo_pass(cb);
+    s_pass_open = 1;
+}
+static WideRec *wq_push(int tex, int semi, int check, int mask, uint32_t base, uint32_t n) {
+    if (s_wq_n >= WQ_MAX) pass_close();
+    WideRec *r = &s_wq[s_wq_n++];
+    r->tex = (uint8_t)tex; r->semi = (int8_t)semi; r->check = (uint8_t)check; r->mask = (uint8_t)mask;
+    r->surf = (int16_t)s_wide_cur; r->wide_w = s_wide_w;
+    r->y1 = (int16_t)s_da_y1; r->y2 = (int16_t)s_da_y2;
+    r->pad_l = (int16_t)view_pad_left; r->pad_r = (int16_t)view_pad_right;
+    r->base = base; r->n = n;
+    return r;
+}
+static void pass_close(void) {
+    if (!s_pass_open && !s_wq_n) return;
+    VkCommandBuffer cb = s_work_cb;
+    if (!cb) { s_pass_open = 0; s_wq_n = 0; return; }   /* cannot happen */
+    const uint64_t t_in = SDL_GetPerformanceCounter();
+    if (s_pass_open) {
+        p_vkCmdEndRenderPass(cb);
+        s_pass_open = 0;
+        vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    }
+    int cur = -1, n = s_wq_n;
+    s_wq_n = 0;
+    const VkShaderStageFlags TS = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDeviceSize off = 0;
+    for (int k = 0; k < n; k++) {
+        WideRec *r = &s_wq[k];
+        if (r->surf < 0 || s_wide_img[r->surf] == VK_NULL_HANDLE) continue;
+        if (r->surf != cur) {
+            if (cur >= 0) p_vkCmdEndRenderPass(cb);
+            cur = r->surf;
+            wide_pass_begin_surf(cb, cur, r->wide_w);
+        }
+        wide_scissor(cb, r->wide_w, r->y1, r->y2, r->pad_l, r->pad_r);
+        int blend = (r->semi < 0) ? 0 : (r->semi + 1);
+        if (!r->tex) {
+            p_vkCmdBindVertexBuffers(cb, 0, 1, &s_vbuf, &off);
+            bind_masked(cb, 0, 0, blend, r->check, r->mask);
+            p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof r->gp, &r->gp);
+            p_vkCmdDraw(cb, r->n, 1, r->base, 0);
+            continue;
+        }
+        p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 1, &s_ds_tex, 0, NULL);
+        p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
+        TexPush tp = r->tp;
+        if (r->semi < 0) {
+            bind_masked(cb, 1, 0, 0, r->check, r->mask);
+            tp.semipass = 0;
+            p_vkCmdPushConstants(cb, s_pl_tex, TS, 0, sizeof tp, &tp);
+            p_vkCmdDraw(cb, r->n, 1, r->base, 0);
+            bind_masked_stencil_only(cb, 1, 0, r->check, 1);
+        } else {
+            bind_masked(cb, 1, 0, 0, r->check, r->mask);
+            tp.semipass = 1;
+            p_vkCmdPushConstants(cb, s_pl_tex, TS, 0, sizeof tp, &tp);
+            p_vkCmdDraw(cb, r->n, 1, r->base, 0);
+            bind_masked(cb, 1, 0, blend, r->check, 1);
+        }
+        tp.semipass = 2;
+        p_vkCmdPushConstants(cb, s_pl_tex, TS, 0, sizeof tp, &tp);
+        p_vkCmdDraw(cb, r->n, 1, r->base, 0);
+    }
+    if (cur >= 0) p_vkCmdEndRenderPass(cb);
+    s_t_close += SDL_GetPerformanceCounter() - t_in;
 }
 
 /* Tight bbox of the open untextured batch (added to s_pack_dirty at flush). */
@@ -3211,33 +3329,29 @@ static DirtyRect s_geo_bbox;
 static void flush_geometry(void) {
     if (s_vcount == 0 || !s_ready) return;
     s_perf_cur.geo_flushes++;
+    const uint64_t t_in = SDL_GetPerformanceCounter();
     uint32_t base = s_vbase, n = s_vcount;
     s_vbase += n; s_vcount = 0;   /* consumed region stays untouched until gpu_sync */
     int semi = s_geo_semi, blend = (semi < 0) ? 0 : (semi + 1);
-    VkCommandBuffer cb = begin_oneshot();
-    VkDeviceSize off = 0;
-    p_vkCmdBindVertexBuffers(cb, 0, 1, &s_vbuf, &off);
+    VkCommandBuffer cb = work_cb();
     if (!s_fg_replay) {
-        vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        begin_geo_pass(cb);
+        VkDeviceSize off = 0;
+        canon_pass_open(cb);
+        p_vkCmdBindVertexBuffers(cb, 0, 1, &s_vbuf, &off);
         set_vp_scissor(cb);
         bind_masked(cb, 0, 0, blend, s_geo_check, s_geo_mask);
         GeoPush gp = { px_shift(), 0.0f, 512.0f };
         p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof gp, &gp);
         p_vkCmdDraw(cb, n, 1, base, 0);
-        p_vkCmdEndRenderPass(cb);
     }
-    if (s_wide_cur >= 0 && !s_geo_mirror_suppress) {   /* native-wide mirror pass (same CB) */
-        wide_pass_begin(cb);
-        bind_masked(cb, 0, 0, blend, s_geo_check, s_geo_mask);
+    if (s_wide_cur >= 0 && !s_geo_mirror_suppress) {   /* native-wide mirror (queued) */
+        WideRec *r = wq_push(0, semi, s_geo_check, s_geo_mask, base, n);
         GeoPush wgp = { px_shift(), (float)wide_dx(), (float)s_wide_w / 2.0f };
-        p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof wgp, &wgp);
-        p_vkCmdDraw(cb, n, 1, base, 0);
-        p_vkCmdEndRenderPass(cb);
+        r->gp = wgp;
     }
     s_geo_mirror_suppress = 0;
-    vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
+    s_t_flush += SDL_GetPerformanceCounter() - t_in;
     if (s_fg_replay) { rect_clear(&s_geo_bbox); return; }   /* VRAM untouched */
     if (s_geo_bbox.set) {
         int x0 = s_geo_bbox.x0 < s_da_x1 ? s_da_x1 : s_geo_bbox.x0;
@@ -3434,21 +3548,22 @@ static void vkb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
 static void flush_tex_batch(void) {
     if (s_tcount == 0 || !s_ready) return;
     s_perf_cur.tex_flushes++;
+    const uint64_t t_in = SDL_GetPerformanceCounter();
     uint32_t base = s_tbase, n = s_tcount;
     s_tbase += n; s_tcount = 0;   /* consumed region stays untouched until gpu_sync */
     int semi = s_tb_semi, blend = (semi < 0) ? 0 : (semi + 1);
-    VkCommandBuffer cb = begin_oneshot();
+    if (s_raw_layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) pass_close();   /* no barrier inside a pass */
+    VkCommandBuffer cb = work_cb();
     img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 1, &s_ds_tex, 0, NULL);
     VkDeviceSize off = 0;
-    p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
     TexPush tp = {0};
     tp.shift = px_shift(); tp.xoff = 0.0f; tp.xhalf = 512.0f;
     tp.maskset = s_tb_mask; tp.filter = s_tb_filter;
     tp.twin[0] = s_tb_twin[0]; tp.twin[1] = s_tb_twin[1]; tp.twin[2] = s_tb_twin[2]; tp.twin[3] = s_tb_twin[3];
     if (!s_fg_replay) {   /* canonical VRAM pass (skipped for a generated picture) */
-    vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    begin_geo_pass(cb);
+    canon_pass_open(cb);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 1, &s_ds_tex, 0, NULL);
+    p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
     set_vp_scissor(cb);
     if (semi < 0) {
         /* OPAQUE batch: the STP bit does not gate COLOUR (every texel is
@@ -3481,35 +3596,15 @@ static void flush_tex_batch(void) {
         p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
         p_vkCmdDraw(cb, n, 1, base, 0);
     }
-    p_vkCmdEndRenderPass(cb);
     }   /* !s_fg_replay */
-    if (s_wide_cur >= 0) {                 /* native-wide mirror pass (same CB) */
-        wide_pass_begin(cb);
+    if (s_wide_cur >= 0) {                 /* native-wide mirror (queued) */
+        WideRec *r = wq_push(1, semi, s_tb_check, s_tb_mask, base, n);
         tp.xoff = (float)wide_dx(); tp.xhalf = (float)s_wide_w / 2.0f;
-        if (semi < 0) {
-            bind_masked(cb, 1, 0, 0, s_tb_check, s_tb_mask);
-            tp.semipass = 0;
-            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
-            p_vkCmdDraw(cb, n, 1, base, 0);
-            bind_masked_stencil_only(cb, 1, 0, s_tb_check, 1);
-            tp.semipass = 2;
-            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
-            p_vkCmdDraw(cb, n, 1, base, 0);
-        } else {
-            bind_masked(cb, 1, 0, 0, s_tb_check, s_tb_mask);
-            tp.semipass = 1;
-            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
-            p_vkCmdDraw(cb, n, 1, base, 0);
-            bind_masked(cb, 1, 0, blend, s_tb_check, 1);
-            tp.semipass = 2;
-            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
-            p_vkCmdDraw(cb, n, 1, base, 0);
-        }
-        p_vkCmdEndRenderPass(cb);
+        r->tp = tp;
     }
-    vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
     s_gpu_dirty = 1;
+    s_t_flush += SDL_GetPerformanceCounter() - t_in;
 }
 
 /* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
