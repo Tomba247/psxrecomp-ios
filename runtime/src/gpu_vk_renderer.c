@@ -406,7 +406,36 @@ static HdMemo           s_hd_memo[HD_MEMO_N];
 static int              s_hd_memo_live;
 static int              s_hd_bb[4] = { 32767, 32767, -1, -1 };   /* VRAM box all entries read from */
 static unsigned         s_hd_stat_miss, s_hd_stat_upload, s_hd_stat_direct, s_hd_stat_composed, s_hd_stat_inval;
+/* Animated textures (water, palette cycling): the game rewrites those VRAM
+ * words every few frames, and a pack rarely holds every frame of the
+ * animation, so the picture alternated between replacement and original.
+ * VRAM is tracked in 64x64-word tiles; a tile written in 12 or more of the
+ * last 32 frames is "animated" and its texels are never replaced. */
+static int s_hd_ready;
+#define HD_TILE_W 16
+#define HD_TILE_H 8
+static uint32_t s_hd_wr_last[HD_TILE_H][HD_TILE_W];
+static uint8_t  s_hd_wr_cnt[HD_TILE_H][HD_TILE_W], s_hd_anim[HD_TILE_H][HD_TILE_W];
+static unsigned s_hd_flip;      /* flips seen by the tracker */
+static int hd_rect_animated(int x0, int y0, int x1, int y1) {
+    if (x1 < x0 || y1 < y0) return 0;
+    for (int ty = (y0 & 511) >> 6; ty <= ((y1 & 511) >> 6); ty++)
+        for (int tx = (x0 & 1023) >> 6; tx <= ((x1 & 1023) >> 6); tx++)
+            if (s_hd_anim[ty][tx]) return 1;
+    return 0;
+}
+static void hd_note_write(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1; if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
+    for (int ty = y0 >> 6; ty <= (y1 >> 6); ty++)
+        for (int tx = x0 >> 6; tx <= (x1 >> 6); tx++)
+            if (s_hd_wr_last[ty][tx] != s_hd_flip + 1u) {
+                s_hd_wr_last[ty][tx] = s_hd_flip + 1u;
+                if (s_hd_wr_cnt[ty][tx] < 255) s_hd_wr_cnt[ty][tx]++;
+            }
+}
 static void hd_memo_invalidate(int x0, int y0, int x1, int y1) {
+    if (s_hd_ready) hd_note_write(x0, y0, x1, y1);
     if (!s_hd_memo_live) return;
     if (x1 < s_hd_bb[0] || x0 > s_hd_bb[2] || y1 < s_hd_bb[1] || y0 > s_hd_bb[3]) return;   /* framebuffer writes */
     s_hd_stat_inval++;
@@ -465,6 +494,23 @@ static uint32_t perf_elapsed_us(uint64_t start) {
 }
 
 static unsigned s_flip_count;   /* GP1(05h) display flips = guest frames */
+/* Every 32 frames: re-classify the VRAM tiles; a change drops the memo. */
+static void hd_flip_tick(void) {
+    if (!s_hd_ready) return;
+    if ((++s_hd_flip & 31u) != 0) return;
+    int changed = 0;
+    for (int ty = 0; ty < HD_TILE_H; ty++)
+        for (int tx = 0; tx < HD_TILE_W; tx++) {
+            const uint8_t a = s_hd_wr_cnt[ty][tx] >= 12;
+            if (a != s_hd_anim[ty][tx]) { s_hd_anim[ty][tx] = a; changed = 1; }
+            s_hd_wr_cnt[ty][tx] = 0;
+        }
+    if (changed) {
+        for (int i = 0; i < HD_MEMO_N; i++) s_hd_memo[i].key = 0;
+        s_hd_memo_live = 0;
+        s_hd_bb[0] = s_hd_bb[1] = 32767; s_hd_bb[2] = s_hd_bb[3] = -1;
+    }
+}
 static uint64_t s_t_flush, s_t_close;   /* ticks in batch flushes / pass close */
 static void perf_snapshot_present(void) {
     s_perf_cur.present_idx = s_present_idx++;
@@ -4172,9 +4218,16 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
             const int qlim[4] = { lim[0] & ~15, lim[1] & ~15, lim[2] | 15, lim[3] | 15 };
             const int *used = lim;
             s_hd_stat_miss++;
+            const int ppw0 = depth == 0 ? 4 : depth == 1 ? 2 : 1;
+            const int animated = !gpu_hd_textures_dump_enabled() &&
+                ((window ? hd_rect_animated(base_x, base_y, base_x + 255 / ppw0, base_y + 255)
+                         : hd_rect_animated(base_x + lim[0] / ppw0, base_y + lim[1],
+                                            base_x + lim[2] / ppw0, base_y + lim[3])) ||
+                 (depth < 2 && hd_rect_animated(clut_x, clut_y, clut_x + (depth == 0 ? 15 : 255), clut_y)));
             if (s_fg_replay) gpu_hd_textures_suppress_dumps(1);
-            int got = gpu_hd_textures_acquire_gl_draw(texpage, clut_x, clut_y, lim, window, semi >= 0, &hd);
-            if (!got || hd.alpha_mode == 4) {
+            memset(&hd, 0, sizeof hd);
+            int got = animated ? 0 : gpu_hd_textures_acquire_gl_draw(texpage, clut_x, clut_y, lim, window, semi >= 0, &hd);
+            if (!animated && (!got || hd.alpha_mode == 4)) {
                 gpu_hd_textures_release_image(&hd);
                 used = qlim;
                 got = gpu_hd_textures_acquire_gl_draw(texpage, clut_x, clut_y, qlim, window, semi >= 0, &hd);
@@ -4973,6 +5026,7 @@ SDL_DisplayMode dm;   /* psx_sdl.h keeps the SDL2 call shape on SDL3 too */
 void vk_renderer_display_flip(void) {
     if (!s_ctx_ok || !s_ready) return;
     s_flip_count++;
+    hd_flip_tick();
     if (!fg_enabled()) { if (s_fg_list[0].n || s_fg_list[1].n) fg_reset(); return; }
     FgList *cur = &s_fg_list[s_fg_cur], *prev = &s_fg_list[s_fg_cur ^ 1];
     if (cur->n == 0) return;                      /* nothing drawn: not a frame boundary */

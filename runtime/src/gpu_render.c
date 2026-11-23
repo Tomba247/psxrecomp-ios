@@ -107,6 +107,10 @@ static void hd_note(int op, int x, int y, int w, int h, const uint16_t *words) {
 static void hd_invalidate_draw(int x0, int y0, int x1, int y1) {
     int ax0, ay0, ax1, ay1;
     if (!gpu_hd_textures_active()) return;
+    /* Vulkan keeps rendered pixels on the GPU: the native array the pack
+     * hashes never sees a draw, so there is nothing to invalidate (and this
+     * ran once per primitive). */
+    if (g_effective == GR_BACKEND_VULKAN) return;
     g_b->get_draw_area(&ax0, &ay0, &ax1, &ay1);
     x0 += g_hd_offset_x; x1 += g_hd_offset_x;
     y0 += g_hd_offset_y; y1 += g_hd_offset_y;
@@ -199,10 +203,17 @@ void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) {
         g_b->hd_texture_note(GR_HD_NOTE_END_COPY, 0, 0, 0, 0, 0, 0);
         return;
     }
-    if (g_effective == GR_BACKEND_VULKAN) g_b->vram_read(0,0);
+    if (g_effective == GR_BACKEND_VULKAN) {
+        /* The copy happens on the GPU. Reading all of VRAM back before and
+         * after it (two full readbacks per copy, about one copy per frame in
+         * Tomba 2) stalled every frame; the copied texels are simply not
+         * replaceable, so the destination's identity is dropped instead. */
+        g_b->copy_rect(sx, sy, dx, dy, w, h);
+        gpu_hd_textures_invalidate(dx, dy, w, h);
+        return;
+    }
     gpu_hd_textures_begin_copy(sx,sy,dx,dy,w,h);
     g_b->copy_rect(sx, sy, dx, dy, w, h);
-    if (g_effective == GR_BACKEND_VULKAN) g_b->vram_read(0,0);
     gpu_hd_textures_end_copy();
 }
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
