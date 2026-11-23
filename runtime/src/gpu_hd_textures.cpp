@@ -566,6 +566,8 @@ extern "C" void gpu_hd_textures_restage(void) {
             hd_texture_pack_track_upload(session->beetle, r[0], r[1], r[2], r[3], words.data(), count, nullptr);
     }
 }
+extern "C" int vk_renderer_hd_texture_cached(uint64_t key, uint64_t generation,
+                                            uint32_t* width, uint32_t* height);
 static int acquire_draw(uint16_t tp, uint16_t cx, uint16_t cy,
                                             const int limits[4], uint32_t window,
                                             int semi, GpuHdTextureImage* image, bool allow_gl_cache) {
@@ -610,8 +612,10 @@ static int acquire_draw(uint16_t tp, uint16_t cx, uint16_t cy,
                 match.clip_u + match.clip_width > query.u_last && match.clip_v + match.clip_height > query.v_last) {
                 /* The GPU copy outlives the decoder's smaller CPU LRU. A draw
                  * using that copy must not queue another PNG decode. */
-                if (allow_gl_cache && gl_renderer_hd_texture_cached(match.entry_id, generation,
-                        &image->width, &image->height)) {
+                if (allow_gl_cache && (gl_renderer_hd_texture_cached(match.entry_id, generation,
+                        &image->width, &image->height) ||
+                        vk_renderer_hd_texture_cached(match.entry_id, generation,
+                        &image->width, &image->height))) {
                     image->stride = image->width * 4u;
                 } else {
                     duck_texture_pack_request_decode(session->duck, match.entry_id);

@@ -98,6 +98,19 @@ extern "C" void psx_ios_prepare(int *argc, char ***argv) {
     const fs::path mvk = bundle / "Frameworks" / "MoltenVK.framework" / "MoltenVK";
     if (fs::exists(mvk, ec)) setenv("SDL_VULKAN_LIBRARY", mvk.c_str(), 0);
 
+    /* HD texture pack: Documents/hd-textures is the (writable) pack root. A
+     * pack shipped inside the app is linked in as its "replacements" folder
+     * unless the user put their own there. The bundle path changes with every
+     * install, so the link is refreshed at each start. */
+    {
+        const fs::path root = docs / "hd-textures", link = root / "replacements";
+        const fs::path shipped = bundle / "hdtex" / "replacements";
+        fs::create_directories(root, ec);
+        if (fs::is_symlink(link, ec)) fs::remove(link, ec);
+        if (fs::exists(shipped, ec) && !fs::exists(link, ec)) fs::create_directory_symlink(shipped, link, ec);
+        if (fs::exists(link, ec)) setenv("PSX_HD_TEXTURES", root.c_str(), 0);
+    }
+
     std::vector<std::string> extra;
     {
         std::ifstream in(docs / "args.txt");

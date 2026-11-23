@@ -29,6 +29,7 @@ int  touch_ui_framegen(void) { return 0; }
 int  touch_ui_resolution(void) { return 0; }
 int  touch_ui_tex_smooth(void) { return 0; }
 int  touch_ui_msaa(void) { return 1; }
+int  touch_ui_hd_pack(void) { return 1; }
 
 #else
 
@@ -67,7 +68,8 @@ static int s_init, s_enabled;
 static Finger s_f[MAX_FINGERS];
 static int s_menu_open;
 static int s_show_fps = 0, s_fit = 0, s_mode = MODE_AUTO, s_opacity = 1, s_smooth = 1;
-static int s_tex = 0;        /* polygon texture filter: 0 = sharp, 1 = smooth */
+static int s_tex = 2;        /* textures: 0 = sharp, 1 = smooth, 2 = HD pack (applies at start; smooth where the pack has nothing) */
+static int s_tex_boot = -1;
 static int s_res = 0;        /* internal resolution: 0 = the game default, else 1..6 x */
 static int s_aa = 0, s_aa_boot = -1;   /* MSAA: 0 off, 1 = 2x, 2 = 4x (applies at start) */
 static int s_res_boot = -1;  /* value this run started with */
@@ -97,6 +99,7 @@ static void cfg_load(void) {
         else if (sscanf(line, "frame_rate=%d", &v) == 1) s_smooth = v == 2 ? 3 : (v < 0 || v > 2 ? 1 : v);
         else if (sscanf(line, "fps_mode=%d", &v) == 1) s_smooth = v < 0 || v > 3 ? 1 : v;
         else if (sscanf(line, "tex_smooth=%d", &v) == 1) s_tex = v != 0;
+        else if (sscanf(line, "textures=%d", &v) == 1) s_tex = v < 0 || v > 2 ? 2 : v;
         else if (sscanf(line, "msaa=%d", &v) == 1) s_aa = v < 0 || v > 2 ? 0 : v;
         else if (sscanf(line, "resolution=%d", &v) == 1) s_res = v < 0 || v > 6 ? 0 : v;
     }
@@ -106,7 +109,7 @@ static void cfg_load(void) {
 static void cfg_save(void) {
     FILE *f = fopen(s_cfg_path, "w");
     if (!f) return;
-    fprintf(f, "show_fps=%d\nfit_screen=%d\ntouch_mode=%d\nopacity=%d\nfps_mode=%d\nresolution=%d\ntex_smooth=%d\nmsaa=%d\n",
+    fprintf(f, "show_fps=%d\nfit_screen=%d\ntouch_mode=%d\nopacity=%d\nfps_mode=%d\nresolution=%d\ntextures=%d\nmsaa=%d\n",
             s_show_fps, s_fit, s_mode, s_opacity, s_smooth, s_res, s_tex, s_aa);
     fclose(f);
 }
@@ -126,6 +129,7 @@ static void ui_init(void) {
     cfg_load();
     s_res_boot = s_res;
     s_aa_boot = s_aa;
+    s_tex_boot = s_tex;
     s_has_gamepad = SDL_HasGamepad() ? 1 : 0;
     fprintf(stdout, "psxrecomp: touch ui on (fps %d, fit %d, touch mode %d, opacity %d, gamepad %d)\n",
             s_show_fps, s_fit, s_mode, s_opacity, s_has_gamepad);
@@ -136,6 +140,9 @@ int touch_ui_fit_screen(void) { ui_init(); return s_enabled && s_fit; }
 /* 0 = the game's own 30, 1 = 60 (one in-between picture), 2 = 90 (two), 3 = 120 (three). */
 int touch_ui_framegen(void) { ui_init(); return s_enabled ? s_smooth : 0; }
 int touch_ui_tex_smooth(void) { ui_init(); return s_enabled && s_tex; }
+/* 1 = load the HD texture pack this run (also 1 when the touch UI is off, so
+ * scripted desktop runs follow the environment alone). */
+int touch_ui_hd_pack(void) { ui_init(); return s_enabled ? s_tex_boot == 2 : 1; }
 int touch_ui_msaa(void) { ui_init(); return s_enabled ? (s_aa_boot == 2 ? 4 : s_aa_boot == 1 ? 2 : 1) : 1; }
 int touch_ui_resolution(void) { ui_init(); return s_enabled ? s_res_boot : 0; }
 
@@ -232,7 +239,7 @@ static void menu_tap(float x, float y) {
         if (y < y0 || y > y0 + ROW_H) continue;
         switch (r) {
         case ROW_SMOOTH:  s_smooth = (s_smooth + 1) % 4; break;
-        case ROW_TEX:     s_tex = !s_tex; break;
+        case ROW_TEX:     s_tex = (s_tex + 1) % 3; break;
         case ROW_AA:      s_aa = (s_aa + 1) % 3; break;
         case ROW_FPS:     s_show_fps = !s_show_fps; break;
         case ROW_FIT:     s_fit = !s_fit; break;
@@ -526,13 +533,15 @@ static void draw_menu(void) {
     static const char *const kResNew[7] = { "Default (restart)", "1x (restart)", "2x (restart)", "3x (restart)",
                                             "4x (restart)", "5x (restart)", "6x (restart)" };
     static const char *const kRate[4] = { "30 (original)", "60", "90", "120" };
-    static const char *const kTex[2] = { "Sharp", "Smooth" };
+    static const char *const kTex[3] = { "Sharp", "Smooth", "HD pack" };
+    static const char *const kTexNew[3] = { "Sharp (restart)", "Smooth (restart)", "HD pack (restart)" };
     static const char *const kAa[3] = { "Off", "MSAA 2x", "MSAA 4x" };
     static const char *const kAaNew[3] = { "Off (restart)", "MSAA 2x (restart)", "MSAA 4x (restart)" };
     const char *label[ROW_COUNT] = { "Frame rate", "Show FPS", "Fit to screen", "Resolution", "Anti-aliasing", "Textures", "Touch controls",
                                      "Button opacity", "Close" };
     const char *value[ROW_COUNT] = { kRate[s_smooth], kOnOff[s_show_fps], kOnOff[s_fit],
-                                     s_res == s_res_boot ? kRes[s_res] : kResNew[s_res], s_aa == s_aa_boot ? kAa[s_aa] : kAaNew[s_aa], kTex[s_tex], kMode[s_mode],
+                                     s_res == s_res_boot ? kRes[s_res] : kResNew[s_res], s_aa == s_aa_boot ? kAa[s_aa] : kAaNew[s_aa],
+                                     (s_tex == 2) != (s_tex_boot == 2) ? kTexNew[s_tex] : kTex[s_tex], kMode[s_mode],
                                      kOpac[s_opacity], NULL };
     for (int r = 0; r < ROW_COUNT; r++) {
         const float cy = ROW_Y0 + ROW_STEP * r + ROW_H * 0.5f;

@@ -17,6 +17,10 @@ layout(location = 7) in vec4  a_limits;
  * PS1-faithful default: w below is then exactly 1.0 and the fragment shader
  * reads the noperspective varying, i.e. the pre-feature pipeline unchanged. */
 layout(location = 8) in float a_q;
+/* HD replacement ([mods] texture pack): page-UV rect the replacement image
+ * covers (origin u,v + size) and its alpha mode; mode 0 = native texels. */
+layout(location = 9)  in vec4  a_hd_source;
+layout(location = 10) in float a_hd_mode;
 
 layout(push_constant) uniform PC {
     float u_shift;
@@ -37,10 +41,13 @@ layout(location = 5) flat out int   v_raw;
 layout(location = 6) flat out ivec4 v_limits;
 layout(location = 7) smooth out vec2 v_uv_p;   /* perspective-correct UV */
 layout(location = 8) flat   out int  v_persp;
+layout(location = 9) flat   out vec4 v_hd_source;
+layout(location = 10) flat  out int  v_hd_mode;
 
 void main() {
     v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;
     v_persp = (a_q > 0.0) ? 1 : 0;
+    v_hd_source = a_hd_source; v_hd_mode = int(a_hd_mode + 0.5);
     v_tpage = ivec2(a_tpage + 0.5);
     v_clut  = ivec2(a_clut + 0.5);
     v_depth = int(a_depth + 0.5);

@@ -69,6 +69,7 @@ extern "C" void debug_server_set_shutdown_callback(void (*shutdown)(void));
 extern "C" int g_psx_track_last_store;
 extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "overlay_backend.h"
+#include "gpu_hd_textures.h"
 #include "gpu.h"
 #include "draw_distance.h"
 #include "mod_immediate.h"
@@ -21699,6 +21700,21 @@ int main(int argc, char** argv) {
         if (const char* error = mod_runtime_activation_error()) {
             std::fprintf(stderr,"psxrecomp: %s\n",error);
             return false;
+        }
+        /* Texture pack without the launcher's Mods page (iOS, scripted runs):
+         * PSX_HD_TEXTURES names the pack root (with "replacements" and
+         * "dumps" inside); PSX_HD_DUMP=1 collects dumps instead of loading. */
+        if (const char* hd_root = std::getenv("PSX_HD_TEXTURES")) {
+            const char* hd_dump_env = std::getenv("PSX_HD_DUMP");
+            const int hd_dump = hd_dump_env && hd_dump_env[0] == '1';
+            if (*hd_root && (hd_dump || touch_ui_hd_pack())) {
+                char hd_error[512] = "";
+                if (!gpu_hd_textures_configure(hd_root, hd_dump ? 0 : 1, hd_dump, hd_error, sizeof(hd_error)))
+                    std::fprintf(stdout, "psxrecomp: HD textures: %s\n", hd_error);
+                else
+                    std::fprintf(stdout, "psxrecomp: HD textures: %s (%s)\n", hd_root,
+                                 hd_dump ? "dumping" : "replacements on");
+            }
         }
         resolved_audio_buffer_ms = psx_audio_sync_target(configured_audio_buffer_ms);
         func_override_install();

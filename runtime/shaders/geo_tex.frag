@@ -13,8 +13,11 @@ layout(location = 5) flat in int   v_raw;     /* 1 = no colour modulation */
 layout(location = 6) flat in ivec4 v_limits;  /* prim uv bounds (inclusive) */
 layout(location = 7) smooth in vec2 v_uv_p;   /* perspective-correct UV */
 layout(location = 8) flat   in int  v_persp;  /* 1 = use v_uv_p, else affine */
+layout(location = 9) flat   in vec4 v_hd_source;   /* replacement's page-UV rect */
+layout(location = 10) flat  in int  v_hd_mode;     /* 0 = native texels */
 
 layout(set = 0, binding = 0) uniform usampler2D u_vram;
+layout(set = 1, binding = 0) uniform sampler2D u_hd;   /* HD replacement (mips, linear) */
 
 layout(push_constant) uniform PC {
     float u_shift;
@@ -61,13 +64,59 @@ int neighbour_texel(ivec2 base, ivec2 p) {
 vec3 col5(int raw) {
     return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;
 }
+/* HD replacement sample (ported from the GL backend's hd_texel /
+ * hd_texel_filtered). A texture window (repeat) or a UV outside the page takes
+ * the texel path; otherwise the footprint is clamped to the primitive's own
+ * UV bounds so atlas neighbours cannot bleed in, and the mip chain is used. */
+vec4 hd_sample(vec2 uv, vec2 dx, vec2 dy) {
+    vec2 sz = vec2(textureSize(u_hd, 0));
+    if ((pc.u_twin.x | pc.u_twin.y) != 0 || any(lessThan(uv, vec2(0.0))) ||
+        any(greaterThanEqual(uv, vec2(256.0)))) {
+        ivec2 p = ivec2(floor(uv)); vec2 f = fract(uv);
+        p &= ivec2(255);
+        if ((pc.u_twin.x | pc.u_twin.y) != 0) {
+            p = (p & ~(pc.u_twin.xy * 8)) | ((pc.u_twin.zw & pc.u_twin.xy) * 8);
+        } else {
+            ivec2 q = clamp(p, v_limits.xy, v_limits.zw);
+            f = vec2(q.x > p.x ? 0.0 : (q.x < p.x ? 0.999 : f.x),
+                     q.y > p.y ? 0.0 : (q.y < p.y ? 0.999 : f.y));
+            p = q;
+        }
+        vec2 t = (vec2(p) + f - v_hd_source.xy) / v_hd_source.zw;
+        ivec2 at = clamp(ivec2(floor(t * sz)), ivec2(0), ivec2(sz) - ivec2(1));
+        return texelFetch(u_hd, at, 0);
+    }
+    vec2 lo = (vec2(v_limits.xy) - v_hd_source.xy) / v_hd_source.zw + 0.5 / sz;
+    vec2 hi = (vec2(v_limits.zw) + 1.0 - v_hd_source.xy) / v_hd_source.zw - 0.5 / sz;
+    vec2 t = clamp((uv - v_hd_source.xy) / v_hd_source.zw, lo, max(lo, hi));
+    return textureGrad(u_hd, t, dx / v_hd_source.zw, dy / v_hd_source.zw);
+}
 void main() {
     int stp; vec3 rgb;
     /* v_persp is 0 for every prim unless [video] perspective_texturing is on
      * AND this prim's packet carried full GTE projection provenance, so the
      * default is the PS1's affine (noperspective) mapping. */
     vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;
-    if (pc.u_filter == 0) {
+    vec2 ddx = dFdx(uv), ddy = dFdy(uv);
+    if (v_hd_mode != 0) {
+        vec4 hd = hd_sample(uv, ddx, ddy);
+        rgb = hd.rgb;
+        if (v_hd_mode == 1) {
+            /* Replacement alpha owns coverage; the native texel keeps the STP
+             * bit for the primitive's blend classification. */
+            if (hd.a < 0.5) discard;
+            stp = (fetch_texel(int(floor(uv.x)), int(floor(uv.y))) >> 15) & 1;
+        } else if (v_hd_mode == 2) {
+            if (hd.a < 128.0 / 255.0) discard;
+            stp = 0;
+        } else if (v_hd_mode == 4) {
+            if (hd.a < 0.25) discard;
+            stp = hd.a < 0.75 ? 1 : 0;
+        } else {
+            stp = hd.a <= 242.0 / 255.0 ? 1 : 0;
+            if (all(equal(hd, vec4(0.0))) || (stp == 0 && all(equal(hd.rgb, vec3(0.0))))) discard;
+        }
+    } else if (pc.u_filter == 0) {
         int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));
         if (raw == 0) discard;
         rgb = col5(raw);

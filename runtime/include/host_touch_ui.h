@@ -47,6 +47,8 @@ int  touch_ui_resolution(void);
 int  touch_ui_tex_smooth(void);
 /* MSAA sample count chosen in the panel for THIS run: 1, 2 or 4. */
 int  touch_ui_msaa(void);
+/* 1 = the HD texture pack should be loaded this run. */
+int  touch_ui_hd_pack(void);
 
 #ifdef __cplusplus
 }

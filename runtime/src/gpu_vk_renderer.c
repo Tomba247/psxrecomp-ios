@@ -26,6 +26,7 @@
 #include "host_osd.h"
 #include "host_touch_ui.h"
 #include "frame_pacing.h"
+#include "gpu_hd_textures.h"
 #include "psx_savestate_menu.h"
 #include "psx_host_menu.h"
 #include "psx_rewind.h"
@@ -51,6 +52,7 @@ void vk_renderer_restage_vram_after_savestate(void){}
 void vk_renderer_set_present_mode(int m){(void)m;}
 void vk_renderer_set_display_aspect(int n,int d){(void)n;(void)d;}
 void vk_renderer_display_flip(void){}
+int vk_renderer_hd_texture_cached(uint64_t k, uint64_t g, uint32_t *w, uint32_t *h){ (void)k; (void)g; (void)w; (void)h; return 0; }
 int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
 const GpuRenderBackend *vk_backend_get(void) { return 0; }
 
@@ -357,6 +359,8 @@ static int            s_fg_120_off = 0;    /* 120 turned itself off (display can
 static int            s_fg_hold = 0;       /* a generated picture waits for the next present */
 static uint32_t       s_fg_hold_stamp = 0;
 static void wide_free_all(void);           /* defined with the wide helpers below */
+static void hd_vk_shutdown(void);
+static void hd_vk_reap(void);
 
 static VkSampler       s_samp;
 static VkDescriptorPool s_dpool;
@@ -364,6 +368,63 @@ static VkDescriptorSetLayout s_dsl_tex;   /* binding0: raw usampler2D (frag) */
 static VkDescriptorSetLayout s_dsl_pack;  /* binding0: hr sampler, binding1: raw storage (compute) */
 static VkDescriptorSetLayout s_dsl_blit;  /* binding0: src sampler (frag) */
 static VkDescriptorSet s_ds_tex;
+/* ---- HD texture replacements (texture packs) ------------------------------
+ * A matched draw samples a replacement image instead of native texels. Each
+ * cached replacement is an RGBA8 image with a mip chain and its own
+ * descriptor set (set 1 of the textured pipeline); draws without one bind a
+ * 1x1 dummy. The replacement is a batch key. */
+#define HD_VK_CAP 4096
+#define HD_VK_HINT 8192
+typedef struct {
+    uint64_t key, gen;
+    VkImage img; VkDeviceMemory mem; VkImageView view; VkDescriptorSet ds;
+    uint32_t w, h, last; size_t bytes;
+} HdVkTex;
+static HdVkTex          s_hdv[HD_VK_CAP];
+static uint16_t         s_hd_hint[HD_VK_HINT];
+/* Evicted images wait here until the queue is idle (pending draws may still
+ * sample them); their slots stay reserved until then. */
+static struct { VkImage img; VkDeviceMemory mem; VkImageView view; int slot; } s_hd_retired[HD_VK_CAP];
+static int              s_hd_retired_n;
+static uint8_t          s_hd_slot_busy[HD_VK_CAP];
+/* Draw memo: the answer of the texture-pack lookup for one draw footprint,
+ * valid until a VRAM write touches the texels or the CLUT it read. Lookups
+ * hash VRAM and search the pack; steady scenes repeat the same few hundred
+ * footprints every frame. Negative answers expire (a decode may be pending). */
+#define HD_MEMO_N 8192
+typedef struct {
+    uint64_t key;            /* 0 = empty */
+    uint64_t tex_key, tex_gen;
+    int16_t  slot;           /* -1 = no replacement */
+    int16_t  x0, y0, x1, y1; /* VRAM words read for texels */
+    int16_t  cx0, cx1, cy;   /* CLUT words (cx1 < cx0 = none) */
+    uint8_t  mode;
+    float    src[4];
+    uint32_t stamp;          /* flip count when stored (negatives expire) */
+} HdMemo;
+static HdMemo           s_hd_memo[HD_MEMO_N];
+static int              s_hd_memo_live;
+static void hd_memo_invalidate(int x0, int y0, int x1, int y1) {
+    if (!s_hd_memo_live) return;
+    int live = 0;
+    for (int i = 0; i < HD_MEMO_N; i++) {
+        HdMemo *m = &s_hd_memo[i];
+        if (!m->key) continue;
+        const int tex = !(x1 < m->x0 || x0 > m->x1 || y1 < m->y0 || y0 > m->y1);
+        const int clut = m->cx1 >= m->cx0 && !(y1 < m->cy || y0 > m->cy || x1 < m->cx0 || x0 > m->cx1);
+        if (tex || clut) m->key = 0; else live++;
+    }
+    s_hd_memo_live = live;
+}   /* (key,gen) -> slot+1, direct mapped */
+static VkDescriptorSetLayout s_dsl_hd;
+static VkDescriptorPool s_hd_pool;
+static VkSampler        s_hd_samp;
+static VkImage          s_hd_none_img; static VkDeviceMemory s_hd_none_mem; static VkImageView s_hd_none_view;
+static VkDescriptorSet  s_hd_none_ds;
+static size_t           s_hd_bytes, s_hd_budget;
+static uint32_t         s_hd_clock;
+static int              s_hd_ready;
+static VkDescriptorSet  s_tb_hd_ds;      /* replacement of the open textured batch */
 static VkDescriptorSet s_ds_pack;
 /* Blit src image is rebound per blit; a ring of sets avoids updating a set still
  * in flight (work is no longer waited per-op). Cycled within a frame; the index
@@ -489,7 +550,7 @@ static float s_pq[3];
 /* Textured batch: 19 floats/vert (pos,uv,col,tpage,clut,depth,raw,limits,q).
  * q is the perspective weight ([video] perspective_texturing); 0 = affine,
  * which the vertex shader turns into w == 1.0 — the faithful default. */
-#define TEXV 19
+#define TEXV 24     /* +4 HD source rect, +1 HD mode */
 typedef struct { float v[TEXV]; } TexVert;
 #define VK_TBUF_VERTS 24576               /* multiple of 3 */
 static VkBuffer       s_tbuf;
@@ -509,6 +570,7 @@ static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data);
 static void gpu_copy_rect(int sx, int sy, int dx, int dy, int w, int h);
 static void ensure_cpu(void);             /* GPU -> CPU mirror readback */
 static int  make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, void **map);
+static int  hd_vk_init(void);
 static void free_staging(VkBuffer buf, VkDeviceMemory mem);
 
 /* draw area / offset / per-prim render state (set via the vtable setters) */
@@ -565,6 +627,7 @@ static int rect_intersects(const DirtyRect *r, int x0, int y0, int x1, int y1) {
  * harmless there. Mirrors the GL backend's up_add (20k-randomized-rect
  * host-test-proven merge rule). */
 static void up_add(int x0, int y0, int x1, int y1) {
+    hd_memo_invalidate(x0, y0, x1, y1);
     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
     if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
     if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
@@ -726,6 +789,7 @@ static void vk_gpu_sync_internal(void) {
         staging_release(s_pending_buf[i], s_pending_mem[i]);
     }
     s_pending_n = 0;
+    if (s_hd_retired_n) hd_vk_reap();
     s_ds_blit_idx = 0;
     /* Queue idle: every submitted draw has consumed its vertex-buffer region,
      * so recycle the sub-allocation cursors. An OPEN (unflushed) batch's
@@ -1311,8 +1375,11 @@ static int create_render_targets(void) {
         li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pr;
         if (p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_pl_geo) != VK_SUCCESS) return vk_die("pl geo");
         pr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT; pr.size = sizeof(TexPush);
-        li.setLayoutCount = 1; li.pSetLayouts = &s_dsl_tex;
+        if (!hd_vk_init()) return vk_die("hd texture setup");
+        VkDescriptorSetLayout texl[2] = { s_dsl_tex, s_dsl_hd };
+        li.setLayoutCount = 2; li.pSetLayouts = texl;
         if (p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_pl_tex) != VK_SUCCESS) return vk_die("pl tex");
+        li.setLayoutCount = 1;
         pr.size = sizeof(BlitPush); li.pSetLayouts = &s_dsl_blit;
         if (p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_pl_blit) != VK_SUCCESS) return vk_die("pl blit");
         pr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; pr.size = sizeof(PackPush); li.pSetLayouts = &s_dsl_pack;
@@ -1369,7 +1436,7 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
 
     VkShaderModule vs, fs; VkPipelineLayout layout;
     VkVertexInputBindingDescription bind = {0};
-    VkVertexInputAttributeDescription attrs[9]; uint32_t nattr;
+    VkVertexInputAttributeDescription attrs[11]; uint32_t nattr;
     if (prog == 0) {            /* GEO */
         vs = s_mod_geo_v; fs = s_mod_geo_f; layout = s_pl_geo;
         bind = (VkVertexInputBindingDescription){ 0, sizeof(Vert), VK_VERTEX_INPUT_RATE_VERTEX };
@@ -1388,7 +1455,9 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
         attrs[6] = (VkVertexInputAttributeDescription){ 6, 0, VK_FORMAT_R32_SFLOAT, 52 };
         attrs[7] = (VkVertexInputAttributeDescription){ 7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 56 };
         attrs[8] = (VkVertexInputAttributeDescription){ 8, 0, VK_FORMAT_R32_SFLOAT, 72 };  /* a_q */
-        nattr = 9;
+        attrs[9] = (VkVertexInputAttributeDescription){ 9, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 76 };  /* a_hd_source */
+        attrs[10] = (VkVertexInputAttributeDescription){ 10, 0, VK_FORMAT_R32_SFLOAT, 92 };         /* a_hd_mode */
+        nattr = 11;
     } else {                    /* BLIT (vertex-less: rect from push constant) */
         vs = s_mod_blit_v; fs = s_mod_blit_f; layout = s_pl_blit;
         nattr = 0;
@@ -1565,6 +1634,7 @@ void vk_renderer_shutdown(void) {
     if (s_pl_tex)  p_vkDestroyPipelineLayout(s_dev, s_pl_tex, NULL);
     if (s_pl_blit) p_vkDestroyPipelineLayout(s_dev, s_pl_blit, NULL);
     if (s_pl_pack) p_vkDestroyPipelineLayout(s_dev, s_pl_pack, NULL);
+    hd_vk_shutdown();
     if (s_dpool)    p_vkDestroyDescriptorPool(s_dev, s_dpool, NULL);
     if (s_dsl_tex)  p_vkDestroyDescriptorSetLayout(s_dev, s_dsl_tex, NULL);
     if (s_dsl_pack) p_vkDestroyDescriptorSetLayout(s_dev, s_dsl_pack, NULL);
@@ -3412,6 +3482,7 @@ typedef struct {
     uint32_t base, n;
     GeoPush  gp;
     TexPush  tp;
+    VkDescriptorSet hd_ds;
 } WideRec;
 #define WQ_MAX 4096
 static WideRec s_wq[WQ_MAX];
@@ -3464,7 +3535,10 @@ static void pass_close(void) {
             p_vkCmdDraw(cb, r->n, 1, r->base, 0);
             continue;
         }
-        p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 1, &s_ds_tex, 0, NULL);
+        {
+            VkDescriptorSet sets[2] = { s_ds_tex, r->hd_ds ? r->hd_ds : s_hd_none_ds };
+            p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 2, sets, 0, NULL);
+        }
         p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
         TexPush tp = r->tp;
         if (r->semi < 0) {
@@ -3732,7 +3806,10 @@ static void flush_tex_batch(void) {
     tp.twin[0] = s_tb_twin[0]; tp.twin[1] = s_tb_twin[1]; tp.twin[2] = s_tb_twin[2]; tp.twin[3] = s_tb_twin[3];
     if (!s_fg_replay) {   /* canonical VRAM pass (skipped for a generated picture) */
     canon_pass_open(cb);
-    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 1, &s_ds_tex, 0, NULL);
+    {
+        VkDescriptorSet sets[2] = { s_ds_tex, s_tb_hd_ds ? s_tb_hd_ds : s_hd_none_ds };
+        p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 2, sets, 0, NULL);
+    }
     p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
     set_vp_scissor(cb);
     if (semi < 0) {
@@ -3770,7 +3847,7 @@ static void flush_tex_batch(void) {
     if (s_wide_cur >= 0) {                 /* native-wide mirror (queued) */
         WideRec *r = wq_push(1, semi, s_tb_check, s_tb_mask, base, n);
         wide_xform(s_tb_gate, &tp.xoff, &tp.xhalf);
-        r->tp = tp;
+        r->tp = tp; r->hd_ds = s_tb_hd_ds;
     }
     end_oneshot(cb);
     s_gpu_dirty = 1;
@@ -3780,6 +3857,239 @@ static void flush_tex_batch(void) {
 /* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
  * implementation for GL/VK/SW, see gpu_uv.h. */
 #include "gpu_uv.h"
+
+/* ---- HD replacement texture cache ---------------------------------------- */
+static int hd_vk_init(void) {
+    VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                       VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    VkDescriptorSetLayoutCreateInfo ci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    ci.bindingCount = 1; ci.pBindings = &b;
+    if (p_vkCreateDescriptorSetLayout(s_dev, &ci, NULL, &s_dsl_hd) != VK_SUCCESS) return 0;
+    VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.maxLod = 16.0f;
+    if (p_vkCreateSampler(s_dev, &sci, NULL, &s_hd_samp) != VK_SUCCESS) return 0;
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, HD_VK_CAP + 1 };
+    VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pci.maxSets = HD_VK_CAP + 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
+    if (p_vkCreateDescriptorPool(s_dev, &pci, NULL, &s_hd_pool) != VK_SUCCESS) return 0;
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    ai.descriptorPool = s_hd_pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &s_dsl_hd;
+    if (p_vkAllocateDescriptorSets(s_dev, &ai, &s_hd_none_ds) != VK_SUCCESS) return 0;
+    for (int i = 0; i < HD_VK_CAP; i++)
+        if (p_vkAllocateDescriptorSets(s_dev, &ai, &s_hdv[i].ds) != VK_SUCCESS) return 0;
+    /* 1x1 dummy bound by draws that have no replacement. */
+    if (!make_image(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, &s_hd_none_img, &s_hd_none_mem, &s_hd_none_view)) return 0;
+    {
+        VkCommandBuffer cb = begin_oneshot();
+        img_barrier(cb, s_hd_none_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkClearColorValue z = {{0, 0, 0, 0}};
+        VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        p_vkCmdClearColorImage(cb, s_hd_none_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &rng);
+        img_barrier(cb, s_hd_none_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        end_oneshot(cb);
+    }
+    VkDescriptorImageInfo ii = { s_hd_samp, s_hd_none_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    w.dstSet = s_hd_none_ds; w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+    p_vkUpdateDescriptorSets(s_dev, 1, &w, 0, NULL);
+    const char *e = getenv("PSX_HD_VK_CACHE_MIB");
+    const long mib = e ? atol(e) : 768;
+    s_hd_budget = (size_t)(mib < 64 ? 64 : mib) << 20;
+    s_hd_ready = 1;
+    return 1;
+}
+static void hd_vk_free(HdVkTex *t) {
+    if (t->view) p_vkDestroyImageView(s_dev, t->view, NULL);
+    if (t->img)  p_vkDestroyImage(s_dev, t->img, NULL);
+    if (t->mem)  p_vkFreeMemory(s_dev, t->mem, NULL);
+    s_hd_bytes -= t->bytes;
+    t->view = VK_NULL_HANDLE; t->img = VK_NULL_HANDLE; t->mem = VK_NULL_HANDLE;
+    t->key = t->gen = 0; t->bytes = 0; t->w = t->h = 0;
+}
+/* Queue idle: destroy retired images and release their slots. */
+static void hd_vk_reap(void) {
+    for (int i = 0; i < s_hd_retired_n; i++) {
+        if (s_hd_retired[i].view) p_vkDestroyImageView(s_dev, s_hd_retired[i].view, NULL);
+        if (s_hd_retired[i].img)  p_vkDestroyImage(s_dev, s_hd_retired[i].img, NULL);
+        if (s_hd_retired[i].mem)  p_vkFreeMemory(s_dev, s_hd_retired[i].mem, NULL);
+        s_hd_slot_busy[s_hd_retired[i].slot] = 0;
+    }
+    s_hd_retired_n = 0;
+}
+static void hd_vk_retire(int slot) {
+    HdVkTex *t = &s_hdv[slot];
+    s_hd_retired[s_hd_retired_n].img = t->img; s_hd_retired[s_hd_retired_n].mem = t->mem;
+    s_hd_retired[s_hd_retired_n].view = t->view; s_hd_retired[s_hd_retired_n].slot = slot;
+    s_hd_retired_n++;
+    s_hd_slot_busy[slot] = 1;
+    s_hd_bytes -= t->bytes;
+    t->view = VK_NULL_HANDLE; t->img = VK_NULL_HANDLE; t->mem = VK_NULL_HANDLE;
+    t->key = t->gen = 0; t->bytes = 0; t->w = t->h = 0;
+}
+static void hd_vk_shutdown(void) {
+    if (!s_dev) return;
+    hd_vk_reap();
+    for (int i = 0; i < HD_VK_CAP; i++) if (s_hdv[i].img) hd_vk_free(&s_hdv[i]);
+    if (s_hd_none_view) { p_vkDestroyImageView(s_dev, s_hd_none_view, NULL); s_hd_none_view = VK_NULL_HANDLE; }
+    if (s_hd_none_img)  { p_vkDestroyImage(s_dev, s_hd_none_img, NULL); s_hd_none_img = VK_NULL_HANDLE; }
+    if (s_hd_none_mem)  { p_vkFreeMemory(s_dev, s_hd_none_mem, NULL); s_hd_none_mem = VK_NULL_HANDLE; }
+    if (s_hd_pool) { p_vkDestroyDescriptorPool(s_dev, s_hd_pool, NULL); s_hd_pool = VK_NULL_HANDLE; }
+    if (s_hd_samp) { p_vkDestroySampler(s_dev, s_hd_samp, NULL); s_hd_samp = VK_NULL_HANDLE; }
+    if (s_dsl_hd)  { p_vkDestroyDescriptorSetLayout(s_dev, s_dsl_hd, NULL); s_dsl_hd = VK_NULL_HANDLE; }
+    s_hd_ready = 0; s_hd_bytes = 0;
+}
+static unsigned hd_vk_hint_of(uint64_t key, uint64_t gen) {
+    uint64_t h = (key ^ (gen * 0x9E3779B97F4A7C15ull)) * 0xD6E8FEB86659FD93ull;
+    return (unsigned)(h >> 40) & (HD_VK_HINT - 1);
+}
+static int hd_vk_find(uint64_t key, uint64_t gen) {
+    const unsigned hi = hd_vk_hint_of(key, gen);
+    const int g = (int)s_hd_hint[hi] - 1;
+    if (g >= 0 && s_hdv[g].img && s_hdv[g].key == key && s_hdv[g].gen == gen) return g;
+    for (int i = 0; i < HD_VK_CAP; i++)
+        if (s_hdv[i].img && s_hdv[i].key == key && s_hdv[i].gen == gen) {
+            s_hd_hint[hi] = (uint16_t)(i + 1);
+            return i;
+        }
+    return -1;
+}
+/* The texture-pack decoder asks this before queueing a PNG decode: the GPU
+ * copy outlives its smaller CPU cache. */
+int vk_renderer_hd_texture_cached(uint64_t key, uint64_t generation, uint32_t *width, uint32_t *height) {
+    if (!s_hd_ready) return 0;
+    const int i = hd_vk_find(key, generation);
+    if (i < 0) return 0;
+    *width = s_hdv[i].w; *height = s_hdv[i].h;
+    return 1;
+}
+/* Cache slot of a replacement image, uploading it (with mips) on first use.
+ * -1 = not available (pixels not decoded yet, or it cannot be cached). */
+static int hd_vk_texture(const GpuHdTextureImage *im) {
+    int slot = hd_vk_find(im->cache_key, im->generation);
+    if (slot >= 0) { s_hdv[slot].last = ++s_hd_clock; return slot; }
+    if (!im->rgba || !im->width || !im->height || im->stride != im->width * 4u ||
+        im->width > 8192u || im->height > 8192u) return -1;
+    uint32_t mips = 1;
+    for (uint32_t m = im->width > im->height ? im->width : im->height; m > 1 && mips < 8; m >>= 1) mips++;
+    const size_t bytes = (size_t)im->stride * im->height * 4u / 3u;
+    if (bytes > s_hd_budget) return -1;
+    for (int i = 0; i < HD_VK_CAP && slot < 0; i++) if (!s_hdv[i].img && !s_hd_slot_busy[i]) slot = i;
+    if (s_hd_bytes + bytes > s_hd_budget || slot < 0) {
+        /* Retire least-recently-used images (never one used this frame is
+         * guaranteed only by LRU order; retired images stay alive until the
+         * queue is idle, so pending draws are safe). */
+        int guard = 0;
+        while ((s_hd_bytes + bytes > s_hd_budget || slot < 0) && guard++ < 64) {
+            int old = -1;
+            for (int i = 0; i < HD_VK_CAP; i++)
+                if (s_hdv[i].img && (old < 0 || s_hdv[i].last < s_hdv[old].last)) old = i;
+            if (old < 0) break;
+            hd_vk_retire(old);
+            gpu_hd_textures_note_gl_cache(1);
+            if (slot < 0) {
+                /* No free slot at all: the retired one frees only at a sync. */
+                flush_tex_batch(); flush_geometry(); gpu_sync();
+                for (int i = 0; i < HD_VK_CAP && slot < 0; i++) if (!s_hdv[i].img && !s_hd_slot_busy[i]) slot = i;
+            }
+        }
+        if (slot < 0 || s_hd_bytes + bytes > s_hd_budget) return -1;
+    }
+    HdVkTex *t = &s_hdv[slot];
+    VkImageCreateInfo ci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ci.imageType = VK_IMAGE_TYPE_2D; ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ci.extent.width = im->width; ci.extent.height = im->height; ci.extent.depth = 1;
+    ci.mipLevels = mips; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (p_vkCreateImage(s_dev, &ci, NULL, &t->img) != VK_SUCCESS) { t->img = VK_NULL_HANDLE; return -1; }
+    VkMemoryRequirements req; p_vkGetImageMemoryRequirements(s_dev, t->img, &req);
+    VkMemoryAllocateInfo mi = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mi.allocationSize = req.size;
+    mi.memoryTypeIndex = find_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkBuffer sbuf = VK_NULL_HANDLE; VkDeviceMemory smem = VK_NULL_HANDLE; void *map = NULL;
+    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    if (mi.memoryTypeIndex == UINT32_MAX || p_vkAllocateMemory(s_dev, &mi, NULL, &t->mem) != VK_SUCCESS) {
+        t->mem = VK_NULL_HANDLE; goto fail;
+    }
+    p_vkBindImageMemory(s_dev, t->img, t->mem, 0);
+    vi.image = t->img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = mips; vi.subresourceRange.layerCount = 1;
+    if (p_vkCreateImageView(s_dev, &vi, NULL, &t->view) != VK_SUCCESS) { t->view = VK_NULL_HANDLE; goto fail; }
+    if (!make_staging((VkDeviceSize)im->stride * im->height, &sbuf, &smem, &map)) goto fail;
+    memcpy(map, im->rgba, (size_t)im->stride * im->height);
+    {
+        VkCommandBuffer cb = begin_oneshot();
+        VkImageMemoryBarrier br = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        br.srcQueueFamilyIndex = br.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        br.image = t->img;
+        br.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; br.subresourceRange.layerCount = 1;
+        br.subresourceRange.baseMipLevel = 0; br.subresourceRange.levelCount = mips;
+        br.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; br.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        br.srcAccessMask = 0; br.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, NULL, 0, NULL, 1, &br);
+        VkBufferImageCopy rc = {0};
+        rc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; rc.imageSubresource.layerCount = 1;
+        rc.imageExtent.width = im->width; rc.imageExtent.height = im->height; rc.imageExtent.depth = 1;
+        p_vkCmdCopyBufferToImage(cb, sbuf, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rc);
+        int32_t mw = (int32_t)im->width, mh = (int32_t)im->height;
+        br.subresourceRange.levelCount = 1;
+        for (uint32_t m = 1; m <= mips; m++) {
+            /* Level m-1 is complete: make it a blit source (or final). */
+            br.subresourceRange.baseMipLevel = m - 1;
+            br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; br.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            br.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; br.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   0, 0, NULL, 0, NULL, 1, &br);
+            if (m < mips) {
+                const int32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
+                VkImageBlit bl = {0};
+                bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; bl.srcSubresource.layerCount = 1;
+                bl.srcSubresource.mipLevel = m - 1;
+                bl.srcOffsets[1].x = mw; bl.srcOffsets[1].y = mh; bl.srcOffsets[1].z = 1;
+                bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; bl.dstSubresource.layerCount = 1;
+                bl.dstSubresource.mipLevel = m;
+                bl.dstOffsets[1].x = nw; bl.dstOffsets[1].y = nh; bl.dstOffsets[1].z = 1;
+                p_vkCmdBlitImage(cb, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+                mw = nw; mh = nh;
+            }
+            br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; br.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            br.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; br.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   0, 0, NULL, 0, NULL, 1, &br);
+        }
+        end_oneshot(cb);
+    }
+    defer_staging(sbuf, smem);
+    {
+        VkDescriptorImageInfo ii = { s_hd_samp, t->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w.dstSet = t->ds; w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+        p_vkUpdateDescriptorSets(s_dev, 1, &w, 0, NULL);
+    }
+    t->key = im->cache_key; t->gen = im->generation; t->w = im->width; t->h = im->height;
+    t->bytes = bytes; s_hd_bytes += bytes; t->last = ++s_hd_clock;
+    s_hd_hint[hd_vk_hint_of(t->key, t->gen)] = (uint16_t)(slot + 1);
+    gpu_hd_textures_note_gl_cache(0);
+    return slot;
+fail:
+    if (t->view) { p_vkDestroyImageView(s_dev, t->view, NULL); t->view = VK_NULL_HANDLE; }
+    if (t->img)  { p_vkDestroyImage(s_dev, t->img, NULL); t->img = VK_NULL_HANDLE; }
+    if (t->mem)  { p_vkFreeMemory(s_dev, t->mem, NULL); t->mem = VK_NULL_HANDLE; }
+    return -1;
+}
 
 /* Append a textured triangle to the batch (per-prim state in the vertex; flush
  * first if the batch keys differ or the raw mirror needs packing). col = 3x RGB
@@ -3815,10 +4125,68 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
      * STP passes would straddle overlapping prims — painter's-order violation;
      * see flush_tex_batch). It drains the open batch and draws alone; the next
      * append flushes it out again. Opaque prims keep batching. */
+    /* HD replacement for this draw, if the active texture pack has one. */
+    VkDescriptorSet hd_ds = VK_NULL_HANDLE;
+    float hd_src[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+    int hd_mode = 0;
+    if (s_hd_ready && gpu_hd_textures_active()) {   /* replacements and/or dumping */
+        const uint32_t window = (uint32_t)(twx | (twy << 5) | (tox << 10) | (toy << 15));
+        /* Ask for a 16-texel-aligned footprint: the exact sampled bounds of a
+         * polygon shift by a texel as the camera moves, which would name a
+         * new image (and memo entry) almost every frame. The shader still
+         * clamps sampling to the true bounds in the vertex. */
+        const int qlim[4] = { lim[0] & ~15, lim[1] & ~15, lim[2] | 15, lim[3] | 15 };
+        uint64_t mk = ((uint64_t)texpage << 48) ^ ((uint64_t)clut_x << 36) ^ ((uint64_t)clut_y << 24) ^
+                      ((uint64_t)qlim[0] << 16) ^ ((uint64_t)qlim[1] << 8) ^ (uint64_t)qlim[2] ^
+                      ((uint64_t)qlim[3] << 40) ^ ((uint64_t)window * 0x9E3779B97F4A7C15ull) ^
+                      (semi >= 0 ? 0x8000000000000000ull : 0);
+        mk = (mk ^ (mk >> 29)) * 0xBF58476D1CE4E5B9ull; mk ^= mk >> 32; if (!mk) mk = 1;
+        HdMemo *m = &s_hd_memo[mk & (HD_MEMO_N - 1)];
+        int hit = 0;
+        if (m->key == mk && !gpu_hd_textures_dump_enabled()) {
+            if (m->slot < 0) hit = (s_flip_count - m->stamp) < 20u;
+            else hit = s_hdv[m->slot].img && s_hdv[m->slot].key == m->tex_key && s_hdv[m->slot].gen == m->tex_gen;
+        }
+        if (hit) {
+            if (m->slot >= 0) {
+                s_hdv[m->slot].last = ++s_hd_clock;
+                hd_ds = s_hdv[m->slot].ds; hd_mode = m->mode;
+                hd_src[0] = m->src[0]; hd_src[1] = m->src[1]; hd_src[2] = m->src[2]; hd_src[3] = m->src[3];
+            }
+        } else {
+            GpuHdTextureImage hd;
+            int slot = -1;
+            if (s_fg_replay) gpu_hd_textures_suppress_dumps(1);
+            if (gpu_hd_textures_acquire_gl_draw(texpage, clut_x, clut_y, qlim, window, semi >= 0, &hd)) {
+                if (hd.alpha_mode >= 1 && hd.alpha_mode <= 4 && hd.source_width && hd.source_height) {
+                    slot = hd_vk_texture(&hd);
+                    if (slot >= 0) {
+                        hd_ds = s_hdv[slot].ds; hd_mode = hd.alpha_mode;
+                        hd_src[0] = (float)hd.origin_u; hd_src[1] = (float)hd.origin_v;
+                        hd_src[2] = (float)hd.source_width; hd_src[3] = (float)hd.source_height;
+                        gpu_hd_textures_note_applied();
+                    }
+                }
+            }
+            gpu_hd_textures_release_image(&hd);
+            if (s_fg_replay) gpu_hd_textures_suppress_dumps(0);
+            /* Remember the answer with the VRAM words it depends on. */
+            const int ppw = depth == 0 ? 4 : depth == 1 ? 2 : 1;
+            if (!m->key) s_hd_memo_live++;
+            m->key = mk; m->slot = (int16_t)slot; m->mode = (uint8_t)hd_mode; m->stamp = s_flip_count;
+            m->tex_key = slot >= 0 ? s_hdv[slot].key : 0; m->tex_gen = slot >= 0 ? s_hdv[slot].gen : 0;
+            m->src[0] = hd_src[0]; m->src[1] = hd_src[1]; m->src[2] = hd_src[2]; m->src[3] = hd_src[3];
+            if (window) { m->x0 = (int16_t)base_x; m->x1 = (int16_t)(base_x + 255 / ppw); m->y0 = (int16_t)base_y; m->y1 = (int16_t)(base_y + 255); }
+            else { m->x0 = (int16_t)(base_x + qlim[0] / ppw); m->x1 = (int16_t)(base_x + qlim[2] / ppw);
+                   m->y0 = (int16_t)(base_y + qlim[1]); m->y1 = (int16_t)(base_y + qlim[3]); }
+            m->cy = (int16_t)clut_y; m->cx0 = (int16_t)clut_x;
+            m->cx1 = (int16_t)(depth == 0 ? clut_x + 15 : depth == 1 ? clut_x + 255 : clut_x - 1);
+        }
+    }
     int isolate = (semi >= 0);
     const int gate = vk_bd_gate(1, 0);
     if (s_tcount > 0 &&
-        (isolate || gate != s_tb_gate || semi != s_tb_semi || s_mask_set != s_tb_mask || s_mask_check != s_tb_check ||
+        (isolate || gate != s_tb_gate || hd_ds != s_tb_hd_ds || semi != s_tb_semi || s_mask_set != s_tb_mask || s_mask_check != s_tb_check ||
          texfilter != s_tb_filter ||
          twx != s_tb_twin[0] || twy != s_tb_twin[1] || tox != s_tb_twin[2] || toy != s_tb_twin[3]))
         flush_tex_batch();
@@ -3829,7 +4197,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     }
     if (s_tcount == 0) {
         s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_check = s_mask_check; s_tb_filter = texfilter;
-        s_tb_gate = gate;
+        s_tb_gate = gate; s_tb_hd_ds = hd_ds;
         s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
     }
     int bx0 = xs[0], bx1 = xs[0], by0 = ys[0], by1 = ys[0];
@@ -3845,6 +4213,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
         vp[14] = (float)lim[0];  vp[15] = (float)lim[1];
         vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
         vp[18] = s_pq_valid ? s_pq[i] : 0.0f;   /* a_q; 0 = affine */
+        vp[19] = hd_src[0]; vp[20] = hd_src[1]; vp[21] = hd_src[2]; vp[22] = hd_src[3];
+        vp[23] = (float)hd_mode;
         if (xs[i] < bx0) bx0 = xs[i]; if (xs[i] > bx1) bx1 = xs[i];
         if (ys[i] < by0) by0 = ys[i]; if (ys[i] > by1) by1 = ys[i];
     }
@@ -3908,6 +4278,7 @@ static void vkb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,
 /* VRAM->VRAM copy: blit the source hr region to scratch (resolves overlap),
  * then blit scratch -> dest with STP/mask split. Mirrors the GL backend. */
 static void vkb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
+    hd_memo_invalidate(dx & (VRAM_W - 1), dy & (VRAM_H - 1), (dx & (VRAM_W - 1)) + w - 1, (dy & (VRAM_H - 1)) + h - 1);
     if (!s_ctx_ok || w <= 0 || h <= 0) return;
     flush_cpu_upload();   /* the copy source may include pending CPU writes */
     flush_tex_batch(); flush_geometry();
