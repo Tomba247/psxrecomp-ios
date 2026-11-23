@@ -381,9 +381,26 @@ static uint32_t perf_elapsed_us(uint64_t start) {
     return frequency ? (uint32_t)(ticks * 1000000u / frequency) : 0;
 }
 
+static unsigned s_flip_count;   /* GP1(05h) display flips = guest frames */
 static void perf_snapshot_present(void) {
     s_perf_cur.present_idx = s_present_idx++;
     s_perf_cur.present_qpc = SDL_GetPerformanceCounter();
+    {   /* One log line every 600 presents: is the host keeping up? */
+        static uint64_t t0, wait_us, acq_us, pres_us;
+        static unsigned n, flips0;
+        if (!t0) { t0 = s_perf_cur.present_qpc; flips0 = s_flip_count; }
+        wait_us += s_perf_cur.wait_us; acq_us += s_perf_cur.acquire_us; pres_us += s_perf_cur.present_us;
+        if (++n >= 600) {
+            const double sec = (double)(s_perf_cur.present_qpc - t0) / (double)SDL_GetPerformanceFrequency();
+            if (sec > 0.0)
+                fprintf(stdout, "psxrecomp: vulkan: %.1f pictures/s, %.1f game frames/s; per picture: GPU wait %.2f ms, "
+                                "acquire %.2f ms, present %.2f ms; scale %dx\n",
+                        n / sec, (s_flip_count - flips0) / sec, wait_us / 1000.0 / n, acq_us / 1000.0 / n,
+                        pres_us / 1000.0 / n, s_scale);
+            fflush(stdout);
+            t0 = s_perf_cur.present_qpc; flips0 = s_flip_count; n = 0; wait_us = acq_us = pres_us = 0;
+        }
+    }
     s_perf_ring[s_perf_head % VK_PERF_RING] = s_perf_cur;
     s_perf_head++;
     memset(&s_perf_cur, 0, sizeof s_perf_cur);
@@ -2876,7 +2893,17 @@ static void ensure_cpu(void) {
  * backend's init calls sw_renderer_init). When Vulkan is active the SW mirror
  * is just the CPU readback target. */
 static void vkb_init(uint16_t *vram) { s_vram = vram; s_cpu_dirty = 0; sw_renderer_init(vram); }
-static void vkb_set_scale(int scale) { if (scale >= 1 && scale <= 4) s_scale = scale; }
+static void vkb_set_scale(int scale) {
+    /* The settings panel's Resolution row wins over the session's scale (it is
+     * read once per run, so the value never changes under live images). */
+    const int user = touch_ui_resolution();
+    if (user >= 1 && user <= 6) {
+        if (s_scale != user) fprintf(stdout, "psxrecomp: vulkan: internal resolution %dx from the settings panel\n", user);
+        s_scale = user;
+        return;
+    }
+    if (scale >= 1 && scale <= 4) s_scale = scale;
+}
 static int  vkb_scale(void) { return s_scale; }
 static void vkb_set_texture_filter(int b) { s_texfilter = b ? 1 : 0; }
 static int  vkb_texture_filter(void) { return s_texfilter; }
@@ -4194,6 +4221,7 @@ static int fg_build(FgList *prev, FgList *cur) {
  * since the last switch is a finished frame. */
 void vk_renderer_display_flip(void) {
     if (!s_ctx_ok || !s_ready) return;
+    s_flip_count++;
     if (!fg_enabled()) { if (s_fg_list[0].n || s_fg_list[1].n) fg_reset(); return; }
     FgList *cur = &s_fg_list[s_fg_cur], *prev = &s_fg_list[s_fg_cur ^ 1];
     if (cur->n == 0) return;                      /* nothing drawn: not a frame boundary */

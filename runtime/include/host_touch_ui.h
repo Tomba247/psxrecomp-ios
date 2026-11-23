@@ -40,6 +40,9 @@ void touch_ui_presented(void);
 int  touch_ui_fit_screen(void);
 /* 1 = generate in-between pictures for 60 fps (Vulkan frame generation). */
 int  touch_ui_framegen(void);
+/* Internal resolution chosen in the panel for THIS run: 0 = the game's
+ * default, else a 1..6 x scale. A change applies at the next start. */
+int  touch_ui_resolution(void);
 
 #ifdef __cplusplus
 }
