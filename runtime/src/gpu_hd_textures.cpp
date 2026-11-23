@@ -21,10 +21,10 @@
 
 namespace {
 constexpr size_t kVramWords = 1024u * 512u;
-constexpr size_t kCompositionBudget = 64u * 1024u * 1024u;
+constexpr size_t kCompositionBudget = 256u * 1024u * 1024u;
 /* A tiled scene can use dozens of small compositions per frame. The byte
  * budget bounds memory; a sixteen-entry limit thrashed below that budget. */
-constexpr size_t kCompositionCount = 256;
+constexpr size_t kCompositionCount = 1024;
 constexpr uint32_t kCompositionDimension = 8192;
 constexpr size_t kMaxParts = 64;
 /* Elective full preload of an installed pack: at most this much decoded RGBA

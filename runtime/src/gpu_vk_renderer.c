@@ -391,7 +391,7 @@ static uint8_t          s_hd_slot_busy[HD_VK_CAP];
  * valid until a VRAM write touches the texels or the CLUT it read. Lookups
  * hash VRAM and search the pack; steady scenes repeat the same few hundred
  * footprints every frame. Negative answers expire (a decode may be pending). */
-#define HD_MEMO_N 8192
+#define HD_MEMO_N 16384
 typedef struct {
     uint64_t key;            /* 0 = empty */
     uint64_t tex_key, tex_gen;
@@ -404,8 +404,12 @@ typedef struct {
 } HdMemo;
 static HdMemo           s_hd_memo[HD_MEMO_N];
 static int              s_hd_memo_live;
+static int              s_hd_bb[4] = { 32767, 32767, -1, -1 };   /* VRAM box all entries read from */
+static unsigned         s_hd_stat_miss, s_hd_stat_upload, s_hd_stat_direct, s_hd_stat_composed, s_hd_stat_inval;
 static void hd_memo_invalidate(int x0, int y0, int x1, int y1) {
     if (!s_hd_memo_live) return;
+    if (x1 < s_hd_bb[0] || x0 > s_hd_bb[2] || y1 < s_hd_bb[1] || y0 > s_hd_bb[3]) return;   /* framebuffer writes */
+    s_hd_stat_inval++;
     int live = 0;
     for (int i = 0; i < HD_MEMO_N; i++) {
         HdMemo *m = &s_hd_memo[i];
@@ -415,6 +419,7 @@ static void hd_memo_invalidate(int x0, int y0, int x1, int y1) {
         if (tex || clut) m->key = 0; else live++;
     }
     s_hd_memo_live = live;
+    if (!live) { s_hd_bb[0] = s_hd_bb[1] = 32767; s_hd_bb[2] = s_hd_bb[3] = -1; }
 }   /* (key,gen) -> slot+1, direct mapped */
 static VkDescriptorSetLayout s_dsl_hd;
 static VkDescriptorPool s_hd_pool;
@@ -487,6 +492,12 @@ static void perf_snapshot_present(void) {
                 s_fg_120_off = 1;   /* presents are blocking: the display is not taking 120 */
                 fprintf(stdout, "psxrecomp: vulkan: 90/120 fps turned off, the display is not accepting pictures that fast\n");
             }
+            if (s_hd_ready && gpu_hd_textures_active())
+                fprintf(stdout, "psxrecomp: vulkan: HD textures per second: %.1f lookups (%.1f direct, %.1f assembled), "
+                                "%.1f uploads, %.1f invalidating writes; cache %u MB\n",
+                        s_hd_stat_miss / sec, s_hd_stat_direct / sec, s_hd_stat_composed / sec,
+                        s_hd_stat_upload / sec, s_hd_stat_inval / sec, (unsigned)(s_hd_bytes >> 20));
+            s_hd_stat_miss = s_hd_stat_direct = s_hd_stat_composed = s_hd_stat_upload = s_hd_stat_inval = 0;
             fflush(stdout);
             s_t_flush = s_t_close = 0; flushes = passes = 0;
             t0 = s_perf_cur.present_qpc; flips0 = s_flip_count; n = 0; wait_us = acq_us = pres_us = 0;
@@ -4082,6 +4093,7 @@ static int hd_vk_texture(const GpuHdTextureImage *im) {
     t->key = im->cache_key; t->gen = im->generation; t->w = im->width; t->h = im->height;
     t->bytes = bytes; s_hd_bytes += bytes; t->last = ++s_hd_clock;
     s_hd_hint[hd_vk_hint_of(t->key, t->gen)] = (uint16_t)(slot + 1);
+    s_hd_stat_upload++;
     gpu_hd_textures_note_gl_cache(0);
     return slot;
 fail:
@@ -4131,14 +4143,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     int hd_mode = 0;
     if (s_hd_ready && gpu_hd_textures_active()) {   /* replacements and/or dumping */
         const uint32_t window = (uint32_t)(twx | (twy << 5) | (tox << 10) | (toy << 15));
-        /* Ask for a 16-texel-aligned footprint: the exact sampled bounds of a
-         * polygon shift by a texel as the camera moves, which would name a
-         * new image (and memo entry) almost every frame. The shader still
-         * clamps sampling to the true bounds in the vertex. */
-        const int qlim[4] = { lim[0] & ~15, lim[1] & ~15, lim[2] | 15, lim[3] | 15 };
+        /* Memo by the exact sampled bounds. On a miss the pack is asked for
+         * exactly those bounds first: when one replacement file covers them
+         * the file itself is used (uploaded once, no CPU-side assembly). Only
+         * otherwise is a 16-texel-aligned footprint requested, so that the
+         * assembled ("composed") image is the same one frame after frame
+         * while the camera shifts the exact bounds by a texel. */
         uint64_t mk = ((uint64_t)texpage << 48) ^ ((uint64_t)clut_x << 36) ^ ((uint64_t)clut_y << 24) ^
-                      ((uint64_t)qlim[0] << 16) ^ ((uint64_t)qlim[1] << 8) ^ (uint64_t)qlim[2] ^
-                      ((uint64_t)qlim[3] << 40) ^ ((uint64_t)window * 0x9E3779B97F4A7C15ull) ^
+                      ((uint64_t)lim[0] << 16) ^ ((uint64_t)lim[1] << 8) ^ (uint64_t)lim[2] ^
+                      ((uint64_t)lim[3] << 40) ^ ((uint64_t)window * 0x9E3779B97F4A7C15ull) ^
                       (semi >= 0 ? 0x8000000000000000ull : 0);
         mk = (mk ^ (mk >> 29)) * 0xBF58476D1CE4E5B9ull; mk ^= mk >> 32; if (!mk) mk = 1;
         HdMemo *m = &s_hd_memo[mk & (HD_MEMO_N - 1)];
@@ -4156,16 +4169,24 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
         } else {
             GpuHdTextureImage hd;
             int slot = -1;
+            const int qlim[4] = { lim[0] & ~15, lim[1] & ~15, lim[2] | 15, lim[3] | 15 };
+            const int *used = lim;
+            s_hd_stat_miss++;
             if (s_fg_replay) gpu_hd_textures_suppress_dumps(1);
-            if (gpu_hd_textures_acquire_gl_draw(texpage, clut_x, clut_y, qlim, window, semi >= 0, &hd)) {
-                if (hd.alpha_mode >= 1 && hd.alpha_mode <= 4 && hd.source_width && hd.source_height) {
-                    slot = hd_vk_texture(&hd);
-                    if (slot >= 0) {
-                        hd_ds = s_hdv[slot].ds; hd_mode = hd.alpha_mode;
-                        hd_src[0] = (float)hd.origin_u; hd_src[1] = (float)hd.origin_v;
-                        hd_src[2] = (float)hd.source_width; hd_src[3] = (float)hd.source_height;
-                        gpu_hd_textures_note_applied();
-                    }
+            int got = gpu_hd_textures_acquire_gl_draw(texpage, clut_x, clut_y, lim, window, semi >= 0, &hd);
+            if (!got || hd.alpha_mode == 4) {
+                gpu_hd_textures_release_image(&hd);
+                used = qlim;
+                got = gpu_hd_textures_acquire_gl_draw(texpage, clut_x, clut_y, qlim, window, semi >= 0, &hd);
+            }
+            if (got && hd.alpha_mode >= 1 && hd.alpha_mode <= 4 && hd.source_width && hd.source_height) {
+                slot = hd_vk_texture(&hd);
+                if (slot >= 0) {
+                    hd_ds = s_hdv[slot].ds; hd_mode = hd.alpha_mode;
+                    hd_src[0] = (float)hd.origin_u; hd_src[1] = (float)hd.origin_v;
+                    hd_src[2] = (float)hd.source_width; hd_src[3] = (float)hd.source_height;
+                    gpu_hd_textures_note_applied();
+                    if (hd_mode == 4) s_hd_stat_composed++; else s_hd_stat_direct++;
                 }
             }
             gpu_hd_textures_release_image(&hd);
@@ -4177,10 +4198,20 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
             m->tex_key = slot >= 0 ? s_hdv[slot].key : 0; m->tex_gen = slot >= 0 ? s_hdv[slot].gen : 0;
             m->src[0] = hd_src[0]; m->src[1] = hd_src[1]; m->src[2] = hd_src[2]; m->src[3] = hd_src[3];
             if (window) { m->x0 = (int16_t)base_x; m->x1 = (int16_t)(base_x + 255 / ppw); m->y0 = (int16_t)base_y; m->y1 = (int16_t)(base_y + 255); }
-            else { m->x0 = (int16_t)(base_x + qlim[0] / ppw); m->x1 = (int16_t)(base_x + qlim[2] / ppw);
-                   m->y0 = (int16_t)(base_y + qlim[1]); m->y1 = (int16_t)(base_y + qlim[3]); }
+            else { m->x0 = (int16_t)(base_x + used[0] / ppw); m->x1 = (int16_t)(base_x + used[2] / ppw);
+                   m->y0 = (int16_t)(base_y + used[1]); m->y1 = (int16_t)(base_y + used[3]); }
             m->cy = (int16_t)clut_y; m->cx0 = (int16_t)clut_x;
             m->cx1 = (int16_t)(depth == 0 ? clut_x + 15 : depth == 1 ? clut_x + 255 : clut_x - 1);
+            if (m->x0 < s_hd_bb[0]) s_hd_bb[0] = m->x0;
+            if (m->y0 < s_hd_bb[1]) s_hd_bb[1] = m->y0;
+            if (m->x1 > s_hd_bb[2]) s_hd_bb[2] = m->x1;
+            if (m->y1 > s_hd_bb[3]) s_hd_bb[3] = m->y1;
+            if (m->cx1 >= m->cx0) {
+                if (m->cx0 < s_hd_bb[0]) s_hd_bb[0] = m->cx0;
+                if (m->cy  < s_hd_bb[1]) s_hd_bb[1] = m->cy;
+                if (m->cx1 > s_hd_bb[2]) s_hd_bb[2] = m->cx1;
+                if (m->cy  > s_hd_bb[3]) s_hd_bb[3] = m->cy;
+            }
         }
     }
     int isolate = (semi >= 0);
