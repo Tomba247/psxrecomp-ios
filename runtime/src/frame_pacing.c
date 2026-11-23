@@ -46,10 +46,31 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
  * sub-realtime workload into an unbounded catch-up burst. */
 #define FRAME_PACER_CATCHUP_MAX_PERIODS 12u
 
+static uint64_t (*s_pump_due)(void);
+static void (*s_pump_run)(void);
+void frame_pacer_set_pump(uint64_t (*due)(void), void (*run)(void)) { s_pump_due = due; s_pump_run = run; }
+
+/* Run presenter work that falls before `limit` (waiting for each piece). */
+static void pacer_pump_until(uint64_t limit, uint64_t freq, uint64_t period) {
+    for (int guard = 0; s_pump_due && s_pump_run && guard < 8; guard++) {
+        const uint64_t due = s_pump_due();
+        if (!due || due >= limit) return;
+        for (;;) {
+            const uint64_t now = SDL_GetPerformanceCounter();
+            const uint32_t ms = frame_pacing_sleep_ms(now, due, freq, period);
+            if (ms == 0) break;
+            psx_host_sleep_ms(ms);
+        }
+        while (SDL_GetPerformanceCounter() < due) { /* final sub-ms spin */ }
+        s_pump_run();
+    }
+}
+
 void frame_pacer_wait(FramePacer *p, double period_ms) {
     uint64_t freq = SDL_GetPerformanceFrequency();
     uint64_t period = (uint64_t)((double)freq * (period_ms / 1000.0));
     uint64_t now = SDL_GetPerformanceCounter();
+    pacer_pump_until(now + 1, freq, period);           /* anything already due */
 
     if (p->next_deadline == 0 ||
         now >= p->next_deadline + period * FRAME_PACER_CATCHUP_MAX_PERIODS) {
@@ -65,6 +86,7 @@ void frame_pacer_wait(FramePacer *p, double period_ms) {
         return;
     }
 
+    pacer_pump_until(p->next_deadline, freq, period);
 #if PSX_NATIVE_HOST_PACING
     (void)psx_host_wait_until(p->next_deadline, freq, period);
 #else

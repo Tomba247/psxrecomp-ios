@@ -45,6 +45,12 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
  * period in milliseconds (e.g. 1000.0 / 59.94). */
 void frame_pacer_wait(FramePacer *p, double period_ms);
 
+/* Mid-frame work for the presenter (frame generation shows extra pictures
+ * between two guest frames). `due` returns the performance-counter time of
+ * the next piece of work, or 0 for none; frame_pacer_wait() wakes at that
+ * time and calls `run` before it goes on waiting for the frame deadline. */
+void frame_pacer_set_pump(uint64_t (*due)(void), void (*run)(void));
+
 /* 1 when the panel matches guest cadence and synchronized swaps can supply
  * the guest's VBlank clock (present_vsync_owns_cadence() in main.cpp). The
  * deadline pacer still caps speed if the driver does not actually block.

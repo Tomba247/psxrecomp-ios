@@ -25,6 +25,7 @@
 #include "gpu_sw_renderer.h"
 #include "host_osd.h"
 #include "host_touch_ui.h"
+#include "frame_pacing.h"
 #include "psx_savestate_menu.h"
 #include "psx_host_menu.h"
 #include "psx_rewind.h"
@@ -421,9 +422,9 @@ static void perf_snapshot_present(void) {
                                 "batch CPU %.2f ms, pass replay CPU %.2f ms\n",
                         (double)flushes / n, (double)passes / n, s_t_flush * f, s_t_close * f);
             }
-            if (s_fg_n == 3 && !s_fg_120_off && (acq_us + pres_us) / n > 4500) {
+            if (s_fg_n >= 2 && !s_fg_120_off && (acq_us + pres_us) / n > 4500) {
                 s_fg_120_off = 1;   /* presents are blocking: the display is not taking 120 */
-                fprintf(stdout, "psxrecomp: vulkan: 120 fps mode turned off, the display is not accepting pictures that fast\n");
+                fprintf(stdout, "psxrecomp: vulkan: 90/120 fps turned off, the display is not accepting pictures that fast\n");
             }
             fflush(stdout);
             s_t_flush = s_t_close = 0; flushes = passes = 0;
@@ -2431,29 +2432,48 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
  * the 4:3 native frame widened by EXTRA presents at (4*wide_w : 3*native_w).
  * Returns 0 when no wide surface exists for disp_x (caller falls back). */
 static int present_wide_surf(int i, int disp_y, int disp_h, int linear);
+/* Scheduled pictures of the current game frame (90/120 fps). */
+static struct { int surf; uint64_t due; } s_fgq[4];
+static int s_fgq_n, s_fgq_i, s_fgq_y, s_fgq_h, s_fgq_linear;
+static uint64_t fgq_due(void) { return s_fgq_i < s_fgq_n ? s_fgq[s_fgq_i].due : 0; }
+static void fgq_run(void) {
+    while (s_fgq_i < s_fgq_n && SDL_GetPerformanceCounter() >= s_fgq[s_fgq_i].due) {
+        const int surf = s_fgq[s_fgq_i++].surf;
+        if (s_ready && surf >= 0 && s_wide_img[surf]) present_wide_surf(surf, s_fgq_y, s_fgq_h, s_fgq_linear);
+    }
+}
 int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     if (!s_ctx_ok || !s_ready || s_wide_w <= 0) return 0;
     int i = -1;
     for (int k = 0; k < VK_WIDE_MAX_SURF; k++)
         if (s_wide_img[k] && s_wide_base[k] == disp_x) { i = k; break; }
     if (i < 0) return 0;
+    if (s_fgq_i < s_fgq_n) {
+        /* Pictures of the current frame are still scheduled (90/120): the
+         * pacer pump shows them; this vblank adds nothing. */
+        if (!s_fg_hold) { fgq_run(); return 1; }
+        s_fgq_n = s_fgq_i = 0;          /* a new frame arrived early: drop the rest */
+    }
     if (s_fg_hold && s_present_idx - s_fg_hold_stamp <= 5) {
-        /* Generated in-between pictures go out before the real frame. At 120
-         * two pictures are queued per vblank; the FIFO swapchain shows them on
-         * consecutive display refreshes. */
+        /* Generated in-between pictures go out before the real frame. With one
+         * (60 fps) the real frame follows at the next vblank. With two or
+         * three (90/120) the rest are scheduled evenly across the game frame
+         * and shown from the pacer's wait, one at a time. */
         int g[3], ok = 1;
         for (int k = 0; k < s_fg_n; k++) { g[k] = s_fg_surfs[k]; if (g[k] < 0 || !s_wide_img[g[k]]) ok = 0; }
-        if (ok && s_fg_n == 3) {
-            if (s_fg_next == 0) {
-                s_fg_next = 2;
-                present_wide_surf(g[0], disp_y, disp_h, linear);
-                return present_wide_surf(g[1], disp_y, disp_h, linear);
-            }
-            s_fg_hold = 0;
-            present_wide_surf(g[2], disp_y, disp_h, linear);
-            return present_wide_surf(i, disp_y, disp_h, linear);
-        }
         s_fg_hold = 0;
+        if (ok && s_fg_n >= 2) {
+            const uint64_t now = SDL_GetPerformanceCounter();
+            const double frame = (double)SDL_GetPerformanceFrequency() * (2.0 / 59.94);
+            s_fgq_n = s_fgq_i = 0;
+            for (int k = 1; k <= s_fg_n; k++) {
+                s_fgq[s_fgq_n].surf = k < s_fg_n ? g[k] : i;
+                s_fgq[s_fgq_n].due = now + (uint64_t)(frame * (double)k / (double)(s_fg_n + 1));
+                s_fgq_n++;
+            }
+            s_fgq_y = disp_y; s_fgq_h = disp_h; s_fgq_linear = linear;
+            return present_wide_surf(g[0], disp_y, disp_h, linear);
+        }
         if (ok && s_fg_n == 1) i = g[0];
     } else {
         s_fg_hold = 0;
@@ -3240,6 +3260,7 @@ static void wide_free_all(void) {
     s_wide_cur = -1;
     s_fg_surf = -1; s_fg_hold = 0; s_fg_n = 0;
     s_fg_surfs[0] = s_fg_surfs[1] = s_fg_surfs[2] = -1;
+    s_fgq_n = s_fgq_i = 0;
 }
 
 /* Find (or lazily create) the wide surface for base_x. Returns the surface
@@ -4167,7 +4188,7 @@ static const int kFgArgs[FG_OPS] = {
 static int fg_enabled(void) {
     if (s_fg_on < 0) {
         const char *e = getenv("PSX_VK_FRAMEGEN");
-        s_fg_on = (e && *e) ? (*e == '0' ? 0 : *e == '2' ? 2 : 1) : -2;   /* -2 = follow the settings panel */
+        s_fg_on = (e && *e) ? (*e >= '0' && *e <= '3' ? *e - '0' : 1) : -2;   /* -2 = follow the settings panel */
     }
     return s_fg_on == -2 ? touch_ui_framegen() : s_fg_on;
 }
@@ -4559,7 +4580,9 @@ void vk_renderer_display_flip(void) {
         cur->wide_prims >= 24 && prev->wide_prims >= 24) {
         const int matched = fg_match(prev, cur);
         s_fg_stat_prims += (unsigned)cur->prims; s_fg_stat_matched += (unsigned)matched;
-        const int want = (fg_enabled() == 2 && fg_120_ok()) ? 3 : 1;
+        const int mode = fg_enabled();
+        const int want = (mode >= 2 && fg_120_ok()) ? (mode == 2 ? 2 : 3) : 1;
+        frame_pacer_set_pump(fgq_due, fgq_run);
         int made = 0;
         if (matched * 2 >= cur->prims)
             for (; made < want; made++)

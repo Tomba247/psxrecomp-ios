@@ -94,7 +94,8 @@ static void cfg_load(void) {
         else if (sscanf(line, "touch_mode=%d", &v) == 1) s_mode = v < 0 || v > 2 ? 0 : v;
         else if (sscanf(line, "opacity=%d", &v) == 1) s_opacity = v < 0 || v > 2 ? 1 : v;
         else if (sscanf(line, "smooth_60=%d", &v) == 1) s_smooth = v != 0;
-        else if (sscanf(line, "frame_rate=%d", &v) == 1) s_smooth = v < 0 || v > 2 ? 1 : v;
+        else if (sscanf(line, "frame_rate=%d", &v) == 1) s_smooth = v == 2 ? 3 : (v < 0 || v > 2 ? 1 : v);
+        else if (sscanf(line, "fps_mode=%d", &v) == 1) s_smooth = v < 0 || v > 3 ? 1 : v;
         else if (sscanf(line, "tex_smooth=%d", &v) == 1) s_tex = v != 0;
         else if (sscanf(line, "msaa=%d", &v) == 1) s_aa = v < 0 || v > 2 ? 0 : v;
         else if (sscanf(line, "resolution=%d", &v) == 1) s_res = v < 0 || v > 6 ? 0 : v;
@@ -105,7 +106,7 @@ static void cfg_load(void) {
 static void cfg_save(void) {
     FILE *f = fopen(s_cfg_path, "w");
     if (!f) return;
-    fprintf(f, "show_fps=%d\nfit_screen=%d\ntouch_mode=%d\nopacity=%d\nframe_rate=%d\nresolution=%d\ntex_smooth=%d\nmsaa=%d\n",
+    fprintf(f, "show_fps=%d\nfit_screen=%d\ntouch_mode=%d\nopacity=%d\nfps_mode=%d\nresolution=%d\ntex_smooth=%d\nmsaa=%d\n",
             s_show_fps, s_fit, s_mode, s_opacity, s_smooth, s_res, s_tex, s_aa);
     fclose(f);
 }
@@ -132,7 +133,7 @@ static void ui_init(void) {
 
 int touch_ui_enabled(void) { ui_init(); return s_enabled; }
 int touch_ui_fit_screen(void) { ui_init(); return s_enabled && s_fit; }
-/* 0 = the game's own 30, 1 = 60 (one in-between picture), 2 = 120 (three). */
+/* 0 = the game's own 30, 1 = 60 (one in-between picture), 2 = 90 (two), 3 = 120 (three). */
 int touch_ui_framegen(void) { ui_init(); return s_enabled ? s_smooth : 0; }
 int touch_ui_tex_smooth(void) { ui_init(); return s_enabled && s_tex; }
 int touch_ui_msaa(void) { ui_init(); return s_enabled ? (s_aa_boot == 2 ? 4 : s_aa_boot == 1 ? 2 : 1) : 1; }
@@ -141,7 +142,10 @@ int touch_ui_resolution(void) { ui_init(); return s_enabled ? s_res_boot : 0; }
 /* ---- layout ------------------------------------------------------------- */
 #define DPAD_CX 32.0f
 #define DPAD_CY 68.0f
-#define DPAD_R  20.0f
+#define DPAD_R  17.0f     /* thumbstick base ring */
+#define NUB_R   8.5f      /* the part that follows the thumb */
+#define NUB_MAX 11.0f     /* how far the nub travels from the centre */
+static float s_nub_x, s_nub_y;   /* nub offset from the base centre, in u */
 #define COG_CY  5.0f
 #define COG_R   3.4f
 #define PANEL_HW 55.0f
@@ -180,18 +184,23 @@ static void recompute_pad(void) {
     if (pad_visible()) {
         Ctl c[CTL_COUNT];
         layout(c);
+        float nubx = 0.0f, nuby = 0.0f;
         for (int i = 0; i < MAX_FINGERS; i++) {
-            if (!s_f[i].used || s_f[i].ui) continue;
+            if (!s_f[i].used || s_f[i].ui == 1) continue;
             const float x = s_f[i].x * wu(), y = s_f[i].y * 100.0f;
             float dx = x - DPAD_CX, dy = y - DPAD_CY;
             float d = sqrtf(dx * dx + dy * dy);
-            if (d < DPAD_R * 1.4f) {
-                if (d > 4.5f) {
+            if (s_f[i].ui == 2) {
+                /* The thumbstick: this finger owns it until it lifts, however
+                 * far it drifts. Eight directions, small dead zone. */
+                if (d > 3.5f) {
                     if (dx >  0.38f * d) b &= (uint16_t)~B_RIGHT;
                     if (dx < -0.38f * d) b &= (uint16_t)~B_LEFT;
                     if (dy >  0.38f * d) b &= (uint16_t)~B_DOWN;
                     if (dy < -0.38f * d) b &= (uint16_t)~B_UP;
                 }
+                const float k = d > NUB_MAX ? NUB_MAX / d : 1.0f;
+                nubx = dx * k; nuby = dy * k;
                 continue;
             }
             for (int k = 0; k < CTL_COUNT; k++) {
@@ -201,6 +210,10 @@ static void recompute_pad(void) {
                     : fabsf(dx) < c[k].hw * 1.2f && fabsf(dy) < c[k].hh * 1.6f;
                 if (hit) b &= (uint16_t)~c[k].bit;
             }
+        }
+        if (fabsf(nubx - s_nub_x) > 0.25f || fabsf(nuby - s_nub_y) > 0.25f ||
+            ((nubx == 0.0f && nuby == 0.0f) && (s_nub_x != 0.0f || s_nub_y != 0.0f))) {
+            s_nub_x = nubx; s_nub_y = nuby; s_dirty = 1;
         }
     }
     if (b != s_buttons) { s_buttons = b; s_dirty = 1; }
@@ -218,7 +231,7 @@ static void menu_tap(float x, float y) {
         const float y0 = ROW_Y0 + ROW_STEP * r;
         if (y < y0 || y > y0 + ROW_H) continue;
         switch (r) {
-        case ROW_SMOOTH:  s_smooth = (s_smooth + 1) % 3; break;
+        case ROW_SMOOTH:  s_smooth = (s_smooth + 1) % 4; break;
         case ROW_TEX:     s_tex = !s_tex; break;
         case ROW_AA:      s_aa = (s_aa + 1) % 3; break;
         case ROW_FPS:     s_show_fps = !s_show_fps; break;
@@ -254,6 +267,11 @@ static void finger(long long id, int phase, float nx, float ny) {
             if (dx * dx + dy * dy < 7.0f * 7.0f) {
                 s_f[slot].ui = 1;
                 s_menu_open = 1; s_dirty = 1;
+            } else if (pad_visible()) {
+                const float sx = x - DPAD_CX, sy = y - DPAD_CY;
+                int taken = 0;
+                for (int i = 0; i < MAX_FINGERS; i++) taken |= (i != slot && s_f[i].used && s_f[i].ui == 2);
+                if (!taken && sx * sx + sy * sy < (DPAD_R * 1.7f) * (DPAD_R * 1.7f)) s_f[slot].ui = 2;
             }
         }
     } else if (slot >= 0) {
@@ -447,21 +465,17 @@ static void draw_pad(void) {
     Ctl c[CTL_COUNT];
     layout(c);
 
-    /* D-pad: a faint disc with four chevrons. */
-    circle(DPAD_CX, DPAD_CY, DPAD_R, 0, 0x000000, a * 0.45f);   /* dark backing: readable on bright scenes */
-    circle(DPAD_CX, DPAD_CY, DPAD_R, 0, 0xFFFFFF, a * 0.22f);
-    circle(DPAD_CX, DPAD_CY, DPAD_R, 0.55f, 0xFFFFFF, a);
-    static const struct { float x, y; uint16_t bit; } kDir[4] = {
-        { 0, -1, B_UP }, { 1, 0, B_RIGHT }, { 0, 1, B_DOWN }, { -1, 0, B_LEFT } };
-    for (int i = 0; i < 4; i++) {
-        const float dx = kDir[i].x, dy = kDir[i].y;
-        const float tx = DPAD_CX + dx * 14.5f, ty = DPAD_CY + dy * 14.5f;   /* tip */
-        const float bx = DPAD_CX + dx * 9.5f,  by = DPAD_CY + dy * 9.5f;    /* base */
-        const int on = (held & kDir[i].bit) != 0;
-        if (on) circle(DPAD_CX + dx * 11.5f, DPAD_CY + dy * 11.5f, 7.0f, 0, 0xFFFFFF, 0.42f);
-        const float al = on ? 1.0f : a * 1.5f;
-        seg(tx, ty, bx - dy * 4.5f, by + dx * 4.5f, 1.3f, 0xFFFFFF, al);
-        seg(tx, ty, bx + dy * 4.5f, by - dx * 4.5f, 1.3f, 0xFFFFFF, al);
+    /* Thumbstick: a base ring and a nub that follows the thumb. */
+    circle(DPAD_CX, DPAD_CY, DPAD_R, 0, 0x000000, a * 0.40f);   /* dark backing: readable on bright scenes */
+    circle(DPAD_CX, DPAD_CY, DPAD_R, 0, 0xFFFFFF, a * 0.16f);
+    circle(DPAD_CX, DPAD_CY, DPAD_R, 0.5f, 0xFFFFFF, a);
+    {
+        const int moving = (held & (B_UP | B_DOWN | B_LEFT | B_RIGHT)) != 0;
+        const float nx = DPAD_CX + s_nub_x, ny = DPAD_CY + s_nub_y;
+        circle(nx, ny, NUB_R, 0, 0x000000, a * 0.55f);
+        circle(nx, ny, NUB_R, 0, 0xFFFFFF, moving ? 0.55f : a * 0.9f);
+        circle(nx, ny, NUB_R, 0.5f, 0xFFFFFF, moving ? 1.0f : a * 1.5f);
+        circle(nx, ny, NUB_R * 0.45f, 0.4f, 0xFFFFFF, a * 1.2f);
     }
 
     for (int i = 0; i < CTL_COUNT; i++) {
@@ -511,7 +525,7 @@ static void draw_menu(void) {
     static const char *const kRes[7] = { "Default", "1x", "2x", "3x", "4x", "5x", "6x" };
     static const char *const kResNew[7] = { "Default (restart)", "1x (restart)", "2x (restart)", "3x (restart)",
                                             "4x (restart)", "5x (restart)", "6x (restart)" };
-    static const char *const kRate[3] = { "30 (original)", "60", "120" };
+    static const char *const kRate[4] = { "30 (original)", "60", "90", "120" };
     static const char *const kTex[2] = { "Sharp", "Smooth" };
     static const char *const kAa[3] = { "Off", "MSAA 2x", "MSAA 4x" };
     static const char *const kAaNew[3] = { "Off (restart)", "MSAA 2x (restart)", "MSAA 4x (restart)" };
