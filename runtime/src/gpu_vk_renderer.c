@@ -32,6 +32,7 @@
 #include "psx_rewind.h"
 #include "crash_trace.h"
 #include "gpu_vk_upload.h"
+#include "gpu_projective_clip.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -52,6 +53,9 @@ void vk_renderer_restage_vram_after_savestate(void){}
 void vk_renderer_set_present_mode(int m){(void)m;}
 void vk_renderer_set_display_aspect(int n,int d){(void)n;(void)d;}
 void vk_renderer_display_flip(void){}
+int  vk_renderer_projective_supported(void){return 0;}
+void vk_renderer_draw_projected_triangle(const PSXProjectedVertex *v,uint16_t tp,uint16_t cx,uint16_t cy,int raw,int semi,int persp){(void)v;(void)tp;(void)cx;(void)cy;(void)raw;(void)semi;(void)persp;}
+void vk_renderer_set_triangle_depth_scale(float q){(void)q;}
 int vk_renderer_hd_texture_cached(uint64_t k, uint64_t g, uint32_t *w, uint32_t *h){ (void)k; (void)g; (void)w; (void)h; return 0; }
 int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
 const GpuRenderBackend *vk_backend_get(void) { return 0; }
@@ -3460,8 +3464,12 @@ static void wide_xform(int gate, float *xoff, float *xhalf) {
 static void wide_free_all(void) {
     int any = 0;
     for (int i = 0; i < VK_WIDE_MAX_SURF; i++) any |= (s_wide_img[i] != VK_NULL_HANDLE);
-    pass_close();   /* queued mirror draws reference these surfaces */
-    if (any) p_vkQueueWaitIdle(s_queue);   /* surfaces may be referenced in flight */
+    /* Queued mirror draws reference these surfaces, and so do clears and copies
+     * already recorded in the shared command buffer, which is not submitted
+     * until the next sync: destroying the images under it crashed that submit
+     * (a display-width change at a door or scene switch). Submit it and wait. */
+    pass_close();
+    if (any) { s_work_pending = 1; vk_gpu_sync_internal(); }
     for (int i = 0; i < VK_WIDE_MAX_SURF; i++) {
         if (s_wide_fb[i])      { p_vkDestroyFramebuffer(s_dev, s_wide_fb[i], NULL); s_wide_fb[i] = VK_NULL_HANDLE; }
         if (s_wide_view[i])    { p_vkDestroyImageView(s_dev, s_wide_view[i], NULL); s_wide_view[i] = VK_NULL_HANDLE; }
@@ -3834,7 +3842,12 @@ static void vkb_set_precise_triangle(int enabled,
         s_pc_x[2] = (float)x2 / 65536.0f;  s_pc_y[2] = (float)y2 / 65536.0f;
     }
 }
+static float s_pq_scale;              /* s_pq[i] * s_pq_scale = 1 / camera depth; 0 = unknown */
+static int   s_projected_uv;          /* s_proj_u/v replace the integer UVs (clipped faces) */
+static float s_proj_u[3], s_proj_v[3];
+void vk_renderer_set_triangle_depth_scale(float q) { s_pq_scale = s_pq_valid && q > 0.0f ? q : 0.0f; }
 static void vkb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+    s_pq_scale = 0.0f;
     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
     /* The corrected-triangle tally lives in the software rasterizer and backs
@@ -3844,7 +3857,7 @@ static void vkb_set_perspective_triangle(int enabled, float q0, float q1, float 
 }
 /* The override describes exactly one triangle; drop it once submitted so a
  * later prim can never inherit it. */
-static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; }
+static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; s_pq_scale = 0.0f; s_projected_uv = 0; }
 
 /* Position a vertex: the sub-pixel value when geometry_correction supplied one
  * for this triangle, else the integer GP0 position. */
@@ -4260,7 +4273,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     if (!s_ready) return;
     int lim_buf[4];
     int uv_buf[6];
-    const int texfilter = (s_texfilter || (!lim && touch_ui_tex_smooth())) ? 1 : 0;
+    const int texfilter = (s_texfilter || ((!lim || s_projected_uv) && touch_ui_tex_smooth())) ? 1 : 0;
     if (!lim) {
         /* Poly path: exact sampled bounds from the ORIGINAL uvs, then the
          * center-sampling mirror compensation (rect prims arrive with their
@@ -4391,7 +4404,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
         float *vp = s_tmap[s_tbase + s_tcount + i].v;
         vp[0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
         vp[1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
-        vp[2] = (float)us[i];   vp[3] = (float)vs[i];
+        vp[2] = s_projected_uv ? s_proj_u[i] : (float)us[i];
+        vp[3] = s_projected_uv ? s_proj_v[i] : (float)vs[i];
         vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2]; vp[7] = 1.0f;
         vp[8]  = (float)base_x;  vp[9]  = (float)base_y;
         vp[10] = (float)clut_x;  vp[11] = (float)clut_y;
@@ -4453,6 +4467,48 @@ static void vkb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32
     col888(c0, &col[0]); col888(c1, &col[3]); col888(c2, &col[6]);
     gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw, s_semi_en?s_semi_mode:-1, NULL);
     precise_consumed();
+}
+/* Faces crossing the camera plane or the PS1's coordinate range: clip the
+ * signed homogeneous polygon on the CPU (shared with the GL backend) and draw
+ * what is left as ordinary perspective triangles, in order, into both passes. */
+int vk_renderer_projective_supported(void) { return s_ctx_ok && s_ready && s_wide_cur >= 0; }
+static void projected_triangle(const PSXProjectedVertex vertices[3], uint16_t texpage,
+                               uint16_t cx, uint16_t cy, int raw, int semi, int perspective) {
+    PSXProjectedVertex polygon[12];
+    const double left = fmin(s_da_x1, -wide_dx()) - 1.0;
+    const double right = fmax(s_da_x2 + 1, s_wide_w - wide_dx()) + 1.0;
+    const int n = psx_projective_clip_triangle(vertices, polygon, left, right, s_da_y1 - 1.0, s_da_y2 + 1.0);
+    int limits[4] = { (int)vertices[0].u, (int)vertices[0].v, (int)vertices[0].u, (int)vertices[0].v };
+    for (int i = 1; i < 3; i++) {
+        if (vertices[i].u < limits[0]) limits[0] = (int)vertices[i].u;
+        if (vertices[i].v < limits[1]) limits[1] = (int)vertices[i].v;
+        if (vertices[i].u > limits[2]) limits[2] = (int)vertices[i].u;
+        if (vertices[i].v > limits[3]) limits[3] = (int)vertices[i].v;
+    }
+    for (int k = 1; k + 1 < n; k++) {
+        const PSXProjectedVertex v[3] = { polygon[0], polygon[k], polygon[k + 1] };
+        int xs[3], ys[3], us[3], vs[3]; float col[9];
+        s_pc_valid = 1; s_pq_valid = perspective ? 1 : 0; s_projected_uv = 1;
+        for (int i = 0; i < 3; i++) {
+            s_pc_x[i] = (float)(v[i].x / v[i].z); s_pc_y[i] = (float)(v[i].y / v[i].z);
+            xs[i] = (int)floorf(s_pc_x[i]); ys[i] = (int)floorf(s_pc_y[i]);
+            s_pq[i] = (float)(1.0 / v[i].z);
+            s_proj_u[i] = (float)v[i].u; s_proj_v[i] = (float)v[i].v;
+            us[i] = (int)v[i].u; vs[i] = (int)v[i].v;
+            col[i*3] = (float)v[i].r; col[i*3+1] = (float)v[i].g; col[i*3+2] = (float)v[i].b;
+        }
+        gpu_textured_triangle(xs, ys, us, vs, col, texpage, cx, cy, raw, semi, limits);
+        precise_consumed();
+    }
+    precise_consumed();
+}
+static void fg_rec_projected(const PSXProjectedVertex v[3], uint16_t texpage, uint16_t cx, uint16_t cy,
+                             int raw, int semi, int perspective);   /* frame generation */
+void vk_renderer_draw_projected_triangle(const PSXProjectedVertex *vertices, uint16_t texpage,
+                                         uint16_t cx, uint16_t cy, int raw, int semi, int perspective) {
+    if (!vk_renderer_projective_supported()) return;
+    fg_rec_projected(vertices, texpage, cx, cy, raw, semi, perspective);
+    projected_triangle(vertices, texpage, cx, cy, raw, semi, perspective);
 }
 static void vkb_draw_textured_rect(int x,int y,int w,int h,int u,int v,uint16_t cx,uint16_t cy,uint16_t tp){
     gpu_textured_rect(x,y,w,h, u,v, u+w,v+h, cx,cy,tp, s_semi_en?s_semi_mode:-1);
@@ -4683,68 +4739,21 @@ static int vkb_render_wide_display(uint32_t *out, int pitch, int base_x,
  * wide surface. The next present shows that surface, the one after shows the
  * real frame N, so real frames are delayed by one vblank.
  *
- * Primitives are matched by what they draw (kind, texture page, CLUT, uvs),
- * nearest first; an unmatched primitive is drawn where frame N has it. When
- * too little matches (a camera cut) no picture is generated.
+ * vk_framegen_match.h finds where every corner was one frame earlier. When too
+ * little matches (a camera cut) no picture is generated.
  *
  * Guest-visible state is never touched: the replay draws only the wide mirror
  * pass (s_fg_replay), never the VRAM image or the CPU mirror. It therefore
  * works only while the native-wide target is active (3D scenes in widescreen).
  */
-enum { FG_SEMI, FG_MASK, FG_TWIN, FG_MOD, FG_DA, FG_OFF, FG_VIEW, FG_WSET, FG_WDIS,
-       FG_WCLR, FG_WCLRM,
-       FG_FT, FG_GT, FG_TT, FG_STT, FG_FR, FG_TR, FG_TRS, FG_LN, FG_SLN, FG_OPS };
-#define FG_FIRST_PRIM FG_FT
-#define FG_MAX_CMDS 24576
-#define FG_HASH 8192
 #define FG_BASE 0x40000000     /* wide-surface key of the generated picture */
-
-typedef struct {
-    uint8_t op, pc_valid, pq_valid, used, bd, ovr;   /* ovr: move by (sdx, sdy) instead of toward the pair */
-    int16_t offx, offy;
-    float sdx, sdy;
-    float vdx[3], vdy[3];        /* ovr 4: per-vertex motion since the previous frame */
-    int32_t a[20];
-    float pcx[3], pcy[3], pq[3];
-    uint32_t key;
-    int32_t next;
-} FgCmd;
-
-typedef struct {
-    int semi_en, semi_mode, mask_set, mask_check;
-    int tw[4], mod[4], da[4], off[2], view[4];
-    int wide_on, wide_base;
-} FgState;
-
-typedef struct {
-    FgCmd *c;
-    int n, prims, wide_prims, overflow;
-    FgState init;
-} FgList;
+#include "vk_framegen_match.h"
 
 static FgList s_fg_list[2];
 static int s_fg_cur;                 /* index of the list being recorded */
 static int s_fg_on = -1;
-static int s_fg_head[FG_HASH];
 static unsigned s_fg_stat_flips, s_fg_stat_made, s_fg_stat_prims, s_fg_stat_matched;
-static unsigned s_fg_stat_orph, s_fg_stat_orph_vert, s_fg_stat_orph_near;
-
-/* Vertex count and the a[] slots of each vertex's x and y, per op. */
-static const struct { int nv; int xi[3], yi[3]; } kFgPos[FG_OPS] = {
-    [FG_FT]  = { 3, { 0, 2, 4 },  { 1, 3, 5 } },
-    [FG_GT]  = { 3, { 0, 3, 6 },  { 1, 4, 7 } },
-    [FG_TT]  = { 3, { 0, 4, 8 },  { 1, 5, 9 } },
-    [FG_STT] = { 3, { 0, 5, 10 }, { 1, 6, 11 } },
-    [FG_FR]  = { 1, { 0 }, { 1 } },
-    [FG_TR]  = { 1, { 0 }, { 1 } },
-    [FG_TRS] = { 1, { 0 }, { 1 } },
-    [FG_LN]  = { 2, { 0, 2 }, { 1, 3 } },
-    [FG_SLN] = { 2, { 0, 3 }, { 1, 4 } },
-};
-static const int kFgArgs[FG_OPS] = {
-    [FG_FT] = 7, [FG_GT] = 9, [FG_TT] = 15, [FG_STT] = 19, [FG_FR] = 5,
-    [FG_TR] = 9, [FG_TRS] = 11, [FG_LN] = 5, [FG_SLN] = 6,
-};
+static unsigned s_fg_stat_how[FG_HOW_FIELD + 1];
 
 static int fg_enabled(void) {
     if (s_fg_on < 0) {
@@ -4784,6 +4793,7 @@ static void fg_reset(void) {
         s_fg_list[i].overflow = 0;
     }
     s_fg_hold = 0;
+    s_fg_flow_last.ok = 0;
 }
 
 static FgCmd *fg_rec(int op) {
@@ -4796,9 +4806,10 @@ static FgCmd *fg_rec(int op) {
     if (l->n == 0) fg_state_get(&l->init);
     if (l->n >= FG_MAX_CMDS) { l->overflow = 1; return NULL; }
     FgCmd *c = &l->c[l->n++];
-    c->op = (uint8_t)op; c->used = 0; c->pc_valid = 0; c->pq_valid = 0; c->ovr = 0;
+    c->op = (uint8_t)op; c->used = 0; c->pc_valid = 0; c->pq_valid = 0; c->bd = 0; c->moved = 0; c->how = FG_HOW_NONE;
+    c->iz[0] = c->iz[1] = c->iz[2] = 0.0f;
     c->offx = (int16_t)s_off_x; c->offy = (int16_t)s_off_y;
-    c->key = 0; c->next = -1;
+    c->key = c->loose = 0; c->next = -1;
     return c;
 }
 
@@ -4810,19 +4821,38 @@ static void fg_rec_prim(int op, const int32_t *args) {
     memcpy(c->a, args, sizeof(int32_t) * (size_t)n);
     if (kFgPos[op].nv == 3) {
         c->pc_valid = (uint8_t)s_pc_valid; c->pq_valid = (uint8_t)s_pq_valid;
-        for (int i = 0; i < 3; i++) { c->pcx[i] = s_pc_x[i]; c->pcy[i] = s_pc_y[i]; c->pq[i] = s_pq[i]; }
+        for (int i = 0; i < 3; i++) {
+            c->pcx[i] = s_pc_x[i]; c->pcy[i] = s_pc_y[i]; c->pq[i] = s_pq[i];
+            if (s_pq_valid && s_pq_scale > 0.0f) c->iz[i] = s_pq[i] * s_pq_scale;
+        }
     }
-    /* Key: everything the primitive draws with, minus where it is. Lit colours
-     * of textured polygons change from frame to frame, so they stay out. */
-    uint32_t h = 2166136261u ^ (uint32_t)op;
-    for (int i = 0; i < n; i++) {
-        int skip = 0;
-        for (int v = 0; v < kFgPos[op].nv; v++)
-            if (i == kFgPos[op].xi[v] || i == kFgPos[op].yi[v]) skip = 1;
-        if (op == FG_STT && (i == 4 || i == 9 || i == 14)) skip = 1;
-        if (!skip) h = (h ^ (uint32_t)c->a[i]) * 16777619u;
+    fg_set_keys(c);
+    FgList *l = &s_fg_list[s_fg_cur];
+    l->prims++;
+    if (s_wide_cur >= 0) l->wide_prims++;
+}
+
+/* A clipped face is recorded whole: its homogeneous corners interpolate, the
+ * clipped polygon of two frames does not. a[] as FG_STT; a[18] = flags. */
+static void fg_rec_projected(const PSXProjectedVertex v[3], uint16_t texpage, uint16_t cx, uint16_t cy,
+                             int raw, int semi, int perspective) {
+    int32_t a[19];
+    for (int i = 0; i < 3; i++) {
+        a[i*5] = a[i*5 + 1] = 0;
+        a[i*5 + 2] = (int32_t)v[i].u; a[i*5 + 3] = (int32_t)v[i].v;
+        a[i*5 + 4] = (int32_t)(v[i].r * 255.0 + 0.5) | (int32_t)(v[i].g * 255.0 + 0.5) << 8 | (int32_t)(v[i].b * 255.0 + 0.5) << 16;
     }
-    c->key = h;
+    a[15] = cx; a[16] = cy; a[17] = texpage;
+    a[18] = (raw ? 1 : 0) | (perspective ? 2 : 0) | (semi + 1) << 2;
+    FgCmd *c = fg_rec(FG_PROJ);
+    if (!c) return;
+    memcpy(c->a, a, sizeof a);
+    for (int i = 0; i < 3; i++) {     /* relative to the draw offset, like fg_corner */
+        c->pcx[i] = (float)(v[i].x - (double)c->offx * v[i].z);
+        c->pcy[i] = (float)(v[i].y - (double)c->offy * v[i].z);
+        c->pq[i] = (float)v[i].z;
+    }
+    fg_set_keys(c);
     FgList *l = &s_fg_list[s_fg_cur];
     l->prims++;
     if (s_wide_cur >= 0) l->wide_prims++;
@@ -4904,198 +4934,9 @@ static void fgw_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
     vkb_draw_shaded_line(x0,y0,c0,x1,y1,c1);
 }
 
-/* Centre of a primitive relative to its draw offset (buffer-independent). */
-static void fg_centre(const FgCmd *c, float *cx, float *cy) {
-    const int nv = kFgPos[c->op].nv;
-    float x = 0, y = 0;
-    for (int i = 0; i < nv; i++) { x += (float)c->a[kFgPos[c->op].xi[i]]; y += (float)c->a[kFgPos[c->op].yi[i]]; }
-    *cx = x / (float)nv - (float)c->offx;
-    *cy = y / (float)nv - (float)c->offy;
-}
-
-/* Pair every primitive of `cur` with the unused same-key primitive of `prev`
- * nearest to where it is expected to have been: its position now minus the
- * frame's overall motion (gdx, gdy). Index in cur->c[i].next, -1 = none.
- * Returns the number paired. */
-static int fg_is_backdrop(const FgCmd *c);
-static int fg_match(FgList *prev, FgList *cur, float gdx, float gdy) {
-    for (int i = 0; i < FG_HASH; i++) s_fg_head[i] = -1;
-    for (int i = prev->n - 1; i >= 0; i--) {       /* chains end up in draw order */
-        FgCmd *p = &prev->c[i];
-        if (p->op < FG_FIRST_PRIM) continue;
-        p->used = 0;
-        const uint32_t b = p->key & (FG_HASH - 1);
-        p->next = s_fg_head[b]; s_fg_head[b] = i;
-    }
-    int matched = 0;
-    for (int i = 0; i < cur->n; i++) {
-        FgCmd *c = &cur->c[i];
-        if (c->op < FG_FIRST_PRIM) continue;
-        float cx, cy;
-        fg_centre(c, &cx, &cy);
-        if (!fg_is_backdrop(c)) { cx -= gdx; cy -= gdy; }
-        int best = -1, steps = 0;
-        float bestd = 72.0f * 72.0f;               /* native px a primitive may move per frame */
-        for (int j = s_fg_head[c->key & (FG_HASH - 1)]; j >= 0 && steps < 256; j = prev->c[j].next, steps++) {
-            const FgCmd *p = &prev->c[j];
-            if (p->used || p->key != c->key || p->op != c->op) continue;
-            float px, py;
-            fg_centre(p, &px, &py);
-            const float d = (px - cx) * (px - cx) + (py - cy) * (py - cy);
-            if (d < bestd) { bestd = d; best = j; }
-        }
-        c->used = 0;
-        if (best >= 0) { prev->c[best].used = 1; c->used = 1; matched++; }
-        /* cur's own `next` is rebuilt when it becomes prev; reuse it as the pair. */
-        c->next = best;
-    }
-    return matched;
-}
-
-/* Motion consistency. World geometry repeats too (a wall is many quads with
- * the same texture cut-out), so nearest-position pairing can pick the
- * neighbouring tile: that one primitive then travels a tile's width in the
- * generated picture and leaves a hole. Primitives that draw with the same key
- * move together, so within each key group a member whose frame-to-frame
- * motion differs from the group's median (or that found no pair) takes the
- * median instead. Small groups are checked against the whole frame's median. */
-static int fg_is_backdrop(const FgCmd *c);
-static int fg_cmp_float(const void *a, const void *b);
-static float fg_median(float *v, int n) { qsort(v, (size_t)n, sizeof(float), fg_cmp_float); return v[n / 2]; }
-static void fg_regularize(const FgList *prev, FgList *cur) {
-    static float gx[FG_MAX_CMDS], gy[FG_MAX_CMDS];
-    static int   chain[FG_MAX_CMDS], head[FG_HASH], member[1024];
-    static float mx[1024], my[1024];
-    int gn = 0;
-    for (int i = 0; i < FG_HASH; i++) head[i] = -1;
-    for (int i = cur->n - 1; i >= 0; i--) {
-        FgCmd *c = &cur->c[i];
-        chain[i] = -1; c->ovr = 0;
-        if (c->op < FG_FIRST_PRIM || fg_is_backdrop(c)) continue;
-        const uint32_t b = c->key & (FG_HASH - 1);
-        chain[i] = head[b]; head[b] = i;
-        if (c->used && c->next >= 0) {
-            float cx, cy, px, py;
-            fg_centre(c, &cx, &cy); fg_centre(&prev->c[c->next], &px, &py);
-            c->sdx = cx - px; c->sdy = cy - py;
-            gx[gn] = c->sdx; gy[gn] = c->sdy; gn++;
-        }
-    }
-    if (gn < 8) return;
-    const float gmx = fg_median(gx, gn), gmy = fg_median(gy, gn);
-    for (int b = 0; b < FG_HASH; b++) {
-        for (int i = head[b]; i >= 0; i = chain[i]) {
-            FgCmd *c = &cur->c[i];
-            if (c->ovr & 2) continue;                 /* already handled with its group */
-            int n = 0, m = 0;
-            for (int j = i; j >= 0 && n < 1024; j = chain[j]) {
-                FgCmd *d = &cur->c[j];
-                if (d->key != c->key || d->op != c->op || (d->ovr & 2)) continue;
-                d->ovr |= 2; member[n++] = j;
-                if (d->used && d->next >= 0) { mx[m] = d->sdx; my[m] = d->sdy; m++; }
-            }
-            float rx = gmx, ry = gmy, tolx = 32.0f, toly = 32.0f;
-            if (m >= 3) {
-                /* Tolerance from the group's own spread (median absolute
-                 * deviation): perspective and rotation make honest motion
-                 * vary across a wall; a wrong pairing is a tile's width out. */
-                rx = fg_median(mx, m); ry = fg_median(my, m);
-                for (int k = 0; k < m; k++) { mx[k] = fabsf(mx[k] - rx); my[k] = fabsf(my[k] - ry); }
-                tolx = 6.0f + 4.0f * fg_median(mx, m); toly = 6.0f + 4.0f * fg_median(my, m);
-            }
-            for (int k = 0; k < n; k++) {
-                FgCmd *d = &cur->c[member[k]];
-                const int paired = d->used && d->next >= 0;
-                if (paired && fabsf(d->sdx - rx) <= tolx && fabsf(d->sdy - ry) <= toly) continue;
-                if (!paired && m < 3) continue;       /* a lone new primitive: draw it where it is */
-                d->sdx = rx; d->sdy = ry; d->ovr |= 1;
-            }
-        }
-    }
-    for (int i = 0; i < cur->n; i++) cur->c[i].ovr &= 1;
-}
-
-/* Orphans. A primitive whose texture coordinates, palette or colour changed
- * since the previous frame (scrolling water, waterfalls, anything animated)
- * has no pair, and drawn where the new frame has it it stood still while the
- * surfaces around it were moved back: it shook against them 30 times a
- * second. A mesh shares its corners, so each corner of an orphan takes the
- * motion a paired neighbour has for that same corner; corners no neighbour
- * knows take the mean of the ones found, and an orphan with none takes the
- * motion of the nearest paired primitive in draw order. */
-#define FG_VH 32768
-static void fg_orphans(const FgList *prev, FgList *cur) {
-    static uint32_t vk[FG_VH]; static float vx[FG_VH], vy[FG_VH];
-    static int near_idx[FG_MAX_CMDS];
-    memset(vk, 0, sizeof vk);
-    int last = -1, orphans = 0;
-    for (int i = 0; i < cur->n; i++) {
-        FgCmd *c = &cur->c[i];
-        near_idx[i] = last;
-        if (c->op < FG_FIRST_PRIM || fg_is_backdrop(c)) continue;
-        const int paired = c->used && c->next >= 0;
-        if (!paired && !c->ovr) { orphans++; continue; }
-        last = i;
-        const int nv = kFgPos[c->op].nv;
-        if (nv != 3) continue;
-        const FgCmd *p = paired ? &prev->c[c->next] : NULL;
-        for (int v = 0; v < 3; v++) {
-            const int xi = kFgPos[c->op].xi[v], yi = kFgPos[c->op].yi[v];
-            float dx, dy;
-            if (c->ovr || !p) { dx = c->sdx; dy = c->sdy; }
-            else {
-                const float cx = c->pc_valid ? c->pcx[v] : (float)c->a[xi];
-                const float cy = c->pc_valid ? c->pcy[v] : (float)c->a[yi];
-                dx = cx - ((p->pc_valid ? p->pcx[v] : (float)p->a[xi]) - (float)p->offx + (float)c->offx);
-                dy = cy - ((p->pc_valid ? p->pcy[v] : (float)p->a[yi]) - (float)p->offy + (float)c->offy);
-            }
-            const uint32_t k = ((uint32_t)(uint16_t)c->a[xi] << 16 | (uint16_t)c->a[yi]) | 0x80000000u;
-            uint32_t h = (k * 2654435761u) >> 17;
-            for (int t = 0; t < 8; t++, h = (h + 1) & (FG_VH - 1)) {
-                if (vk[h] == k) break;
-                if (!vk[h]) { vk[h] = k; vx[h] = dx; vy[h] = dy; break; }
-            }
-        }
-    }
-    s_fg_stat_orph += (unsigned)orphans;
-    if (!orphans) return;
-    last = -1;
-    for (int i = cur->n - 1; i >= 0; i--) {     /* nearest paired primitive on either side */
-        const FgCmd *c = &cur->c[i];
-        const int before = near_idx[i];
-        near_idx[i] = (before >= 0 && (last < 0 || i - before <= last - i)) ? before : last;
-        if (c->op >= FG_FIRST_PRIM && !fg_is_backdrop(c) && ((c->used && c->next >= 0) || c->ovr)) last = i;
-    }
-    for (int i = 0; i < cur->n; i++) {
-        FgCmd *c = &cur->c[i];
-        if (c->op < FG_FIRST_PRIM || fg_is_backdrop(c) || (c->used && c->next >= 0) || c->ovr) continue;
-        const int nv = kFgPos[c->op].nv;
-        int found = 0; float sx = 0, sy = 0; int have[3] = { 0, 0, 0 };
-        if (nv == 3) {
-            for (int v = 0; v < 3; v++) {
-                const int xi = kFgPos[c->op].xi[v], yi = kFgPos[c->op].yi[v];
-                const uint32_t k = ((uint32_t)(uint16_t)c->a[xi] << 16 | (uint16_t)c->a[yi]) | 0x80000000u;
-                uint32_t h = (k * 2654435761u) >> 17;
-                for (int t = 0; t < 8 && vk[h]; t++, h = (h + 1) & (FG_VH - 1))
-                    if (vk[h] == k) { c->vdx[v] = vx[h]; c->vdy[v] = vy[h]; have[v] = 1; found++; sx += vx[h]; sy += vy[h]; break; }
-            }
-        }
-        if (found) {
-            for (int v = 0; v < 3; v++) if (!have[v]) { c->vdx[v] = sx / (float)found; c->vdy[v] = sy / (float)found; }
-            c->ovr = 4; s_fg_stat_orph_vert++;
-        } else if (near_idx[i] >= 0) {
-            const FgCmd *q = &cur->c[near_idx[i]];
-            if (fabsf(q->sdx) <= 72.0f && fabsf(q->sdy) <= 72.0f) {
-                c->sdx = q->sdx; c->sdy = q->sdy; c->ovr = 1; c->vdx[0] = -12345.0f; s_fg_stat_orph_near++;
-            }
-        }
-    }
-}
-
-/* Diagnostic (PSX_VK_FG_CSV=<file>): one line per frame saying how every
- * primitive was placed in the in-between picture and how much screen each
- * class covers. "loose" primitives are drawn where the new frame has them
- * while their surroundings move: that is what shows as shaking. */
+/* Diagnostic (PSX_VK_FG_CSV=<file>): one line per frame saying how the motion
+ * of every primitive was found and how much screen each class covers. "field"
+ * is the guess: motion taken from the surroundings. */
 static float fg_area(const FgCmd *c) {
     const int nv = kFgPos[c->op].nv;
     if (nv == 3) {
@@ -5109,143 +4950,75 @@ static float fg_area(const FgCmd *c) {
     return 0.0f;
 }
 static void fg_csv(const FgList *cur, int matched, int made) {
+    static const char *const names[] = { "none", "still", "camera", "anchor", "mesh", "seed", "loose", "corner", "field" };
     static FILE *f; static int tried;
     if (!tried) { tried = 1; const char *e = getenv("PSX_VK_FG_CSV"); if (e && *e) { f = fopen(e, "w");
-        if (f) fprintf(f, "flip,made,prims,matched,median_dx,median_dy,n_pair,n_group,n_corner,n_near,n_loose,a_pair,a_group,a_corner,a_near,a_loose,loose_ops\n"); } }
+        if (f) {
+            fprintf(f, "flip,made,prims,matched,camera_ok,camera_fit,camera_of,bd_dx,bd_dy");
+            for (int k = 0; k <= FG_HOW_FIELD; k++) fprintf(f, ",n_%s,a_%s", names[k], names[k]);
+            fprintf(f, "\n");
+        } } }
     if (!f) return;
-    int n[5] = {0}; float a[5] = {0}; unsigned ops = 0;
-    static float gx[FG_MAX_CMDS], gy[FG_MAX_CMDS]; int gn = 0;
+    int n[FG_HOW_FIELD + 1] = {0}; float a[FG_HOW_FIELD + 1] = {0};
     for (int i = 0; i < cur->n; i++) {
         const FgCmd *c = &cur->c[i];
         if (c->op < FG_FIRST_PRIM || fg_is_backdrop(c)) continue;
-        const int paired = c->used && c->next >= 0;
-        int k;
-        if (c->ovr == 4) k = 2;
-        else if (c->ovr == 1) k = paired ? 1 : (c->vdx[0] == -12345.0f ? 3 : 1);
-        else if (paired) { k = 0; gx[gn] = c->sdx; gy[gn] = c->sdy; gn++; }
-        else { k = 4; ops |= 1u << (c->op & 31); }
-        n[k]++; a[k] += fg_area(c);
+        n[c->how]++; a[c->how] += fg_area(c);
     }
-    const float mdx = gn ? fg_median(gx, gn) : 0.0f, mdy = gn ? fg_median(gy, gn) : 0.0f;
-    fprintf(f, "%u,%d,%d,%d,%.1f,%.1f,%d,%d,%d,%d,%d,%.0f,%.0f,%.0f,%.0f,%.0f,%x\n", s_flip_count, made, cur->prims, matched, mdx, mdy,
-            n[0], n[1], n[2], n[3], n[4], a[0], a[1], a[2], a[3], a[4], ops);
+    fprintf(f, "%u,%d,%d,%d,%d,%d,%d,%.2f,%.2f", s_flip_count, made, cur->prims, matched,
+            s_fg_flow_last.ok, s_fg_flow_last.inliers, s_fg_flow_last.n, s_fg_bd_dx, s_fg_bd_dy);
+    for (int k = 0; k <= FG_HOW_FIELD; k++) fprintf(f, ",%d,%.0f", n[k], a[k]);
+    fprintf(f, "\n");
     if ((s_flip_count & 31) == 0) fflush(f);
 }
 
-/* The 2D backdrop (sky/water tile grids) moves as one rigid layer, and its
- * tiles repeat, so pairing them one by one by nearest position picks wrong
- * neighbours: tiles jumped and left holes in the generated picture. Backdrop
- * primitives are instead all moved by the layer's median frame-to-frame
- * shift. */
-static int   s_fg_bd_have;
-static float s_fg_bd_dx, s_fg_bd_dy;
-static int fg_is_backdrop(const FgCmd *c) {
-    if (c->op == FG_LN || c->op == FG_SLN) return 0;
-    const int textured = (c->op == FG_TT || c->op == FG_STT || c->op == FG_TR || c->op == FG_TRS);
-    return (c->bd & 1) || (!textured && (c->bd & 2));
-}
-static int fg_cmp_float(const void *a, const void *b) {
-    const float x = *(const float *)a, y = *(const float *)b;
-    return x < y ? -1 : x > y;
-}
-static void fg_backdrop_shift(const FgList *prev, const FgList *cur) {
-    static float dx[2048], dy[2048];
-    int n = 0;
-    for (int i = 0; i < cur->n && n < 2048; i++) {
-        const FgCmd *c = &cur->c[i];
-        if (c->op < FG_FIRST_PRIM || !c->used || c->next < 0 || !fg_is_backdrop(c)) continue;
-        float cx, cy, px, py;
-        fg_centre(c, &cx, &cy); fg_centre(&prev->c[c->next], &px, &py);
-        dx[n] = cx - px; dy[n] = cy - py; n++;
-    }
-    s_fg_bd_have = n > 0;
-    s_fg_bd_dx = s_fg_bd_dy = 0.0f;
-    if (!n) return;
-    qsort(dx, (size_t)n, sizeof(float), fg_cmp_float);
-    qsort(dy, (size_t)n, sizeof(float), fg_cmp_float);
-    s_fg_bd_dx = dx[n / 2]; s_fg_bd_dy = dy[n / 2];
-}
-
-/* Draw `c` halfway toward its pair `p` (NULL = where it is). */
-static void fg_emit(const FgCmd *c, const FgCmd *p) {
+/* Draw `c` back from where it is by the part of its motion that has not
+ * happened yet at time t. `p`: its partner (FG_PROJ, screen-fixed shapes).
+ * bd_still: backdrop tiles stay where the new frame has them (see fg_underpaint). */
+static void fg_emit(const FgCmd *c, const FgCmd *p, int bd_still) {
     int32_t a[20];
     memcpy(a, c->a, sizeof a);
     const int op = c->op, nv = kFgPos[op].nv;
+    const float back = 1.0f - s_fg_t;
     s_fg_bd_bits = c->bd;
     s_pc_valid = 0; s_pq_valid = 0;
-    int bdrop = fg_is_backdrop(c);
-    if (bdrop && p && p->op == op &&
-        !(op == FG_TT || op == FG_STT || op == FG_TR || op == FG_TRS)) {
-        /* An untextured shape that sits at exactly the same place in both
-         * frames is fixed to the screen (cutscene letterbox bars, fades), not
-         * part of the scrolling layer: it must not take the layer's shift. */
-        int same = 1;
-        for (int i = 0; i < nv && same; i++) {
-            const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
-            if (c->a[xi] - c->offx != p->a[xi] - p->offx || c->a[yi] - c->offy != p->a[yi] - p->offy) same = 0;
+    if (op == FG_PROJ) {
+        PSXProjectedVertex v[3];
+        for (int i = 0; i < 3; i++) {
+            float x = c->pcx[i], y = c->pcy[i], z = c->pq[i];
+            if (p) { x -= (x - p->pcx[i]) * back; y -= (y - p->pcy[i]) * back; z -= (z - p->pq[i]) * back; }
+            v[i].x = (double)x + (double)c->offx * z; v[i].y = (double)y + (double)c->offy * z; v[i].z = z;
+            v[i].u = a[i*5 + 2]; v[i].v = a[i*5 + 3];
+            v[i].r = (a[i*5 + 4] & 255) / 255.0; v[i].g = ((a[i*5 + 4] >> 8) & 255) / 255.0; v[i].b = ((a[i*5 + 4] >> 16) & 255) / 255.0;
         }
-        if (same) bdrop = 0;
+        projected_triangle(v, (uint16_t)a[17], (uint16_t)a[15], (uint16_t)a[16], a[18] & 1, ((a[18] >> 2) & 7) - 1, a[18] & 2);
+        return;
     }
-    if (c->ovr == 4 && nv == 3) {
+    float dx[3] = { 0, 0, 0 }, dy[3] = { 0, 0, 0 };
+    if (fg_is_backdrop(c)) {
+        /* One rigid layer; a shape that sits at exactly the same place in both
+         * frames (letterbox bars, fades) is fixed to the screen instead. */
+        if (!bd_still && s_fg_bd_have && !(p && fg_bd_fixed(c, p)))
+            for (int i = 0; i < 3; i++) { dx[i] = s_fg_bd_dx; dy[i] = s_fg_bd_dy; }
+    } else if (c->moved) {
+        for (int i = 0; i < nv; i++) { dx[i] = c->vdx[i]; dy[i] = c->vdy[i]; }
+    }
+    if (nv == 3) {
         s_pq_valid = c->pq_valid;
         for (int i = 0; i < 3; i++) {
             const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
             s_pq[i] = c->pq[i];
-            s_pc_x[i] = (c->pc_valid ? c->pcx[i] : (float)c->a[xi]) - c->vdx[i] * (1.0f - s_fg_t);
-            s_pc_y[i] = (c->pc_valid ? c->pcy[i] : (float)c->a[yi]) - c->vdy[i] * (1.0f - s_fg_t);
+            s_pc_x[i] = (c->pc_valid ? c->pcx[i] : (float)c->a[xi]) - dx[i] * back;
+            s_pc_y[i] = (c->pc_valid ? c->pcy[i] : (float)c->a[yi]) - dy[i] * back;
             a[xi] = (int32_t)floorf(s_pc_x[i]); a[yi] = (int32_t)floorf(s_pc_y[i]);
         }
         s_pc_valid = 1;
-        p = NULL; goto emit;
-    }
-    if (bdrop || c->ovr) {
-        /* Rigid shift: back from where it is now by the part of the frame's
-         * motion that has not happened yet at time t. */
-        const float bx = (bdrop ? (s_fg_bd_have ? s_fg_bd_dx : 0.0f) : c->sdx) * (1.0f - s_fg_t);
-        const float by = (bdrop ? (s_fg_bd_have ? s_fg_bd_dy : 0.0f) : c->sdy) * (1.0f - s_fg_t);
-        if (nv == 3) {
-            s_pq_valid = c->pq_valid;
-            for (int i = 0; i < 3; i++) {
-                const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
-                s_pq[i] = c->pq[i];
-                s_pc_x[i] = (c->pc_valid ? c->pcx[i] : (float)c->a[xi]) - bx;
-                s_pc_y[i] = (c->pc_valid ? c->pcy[i] : (float)c->a[yi]) - by;
-                a[xi] = (int32_t)floorf(s_pc_x[i]); a[yi] = (int32_t)floorf(s_pc_y[i]);
-            }
-            s_pc_valid = 1;
-        } else {
-            const int sx = (int)floorf(bx + 0.5f), sy = (int)floorf(by + 0.5f);
-            for (int i = 0; i < nv; i++) { a[kFgPos[op].xi[i]] -= sx; a[kFgPos[op].yi[i]] -= sy; }
-        }
-        p = NULL; goto emit;
-    }
-    if (nv == 3) {
-        s_pq_valid = c->pq_valid;
-        for (int i = 0; i < 3; i++) s_pq[i] = c->pq[i];
-        if (p) {
-            for (int i = 0; i < 3; i++) {
-                const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
-                const float cx = c->pc_valid ? c->pcx[i] : (float)c->a[xi];
-                const float cy = c->pc_valid ? c->pcy[i] : (float)c->a[yi];
-                const float px = (p->pc_valid ? p->pcx[i] : (float)p->a[xi]) - (float)p->offx + (float)c->offx;
-                const float py = (p->pc_valid ? p->pcy[i] : (float)p->a[yi]) - (float)p->offy + (float)c->offy;
-                s_pc_x[i] = px + (cx - px) * s_fg_t; s_pc_y[i] = py + (cy - py) * s_fg_t;
-                a[xi] = (int32_t)floorf(s_pc_x[i]); a[yi] = (int32_t)floorf(s_pc_y[i]);
-            }
-            s_pc_valid = 1;
-        } else if (c->pc_valid) {
-            for (int i = 0; i < 3; i++) { s_pc_x[i] = c->pcx[i]; s_pc_y[i] = c->pcy[i]; }
-            s_pc_valid = 1;
-        }
-    } else if (p) {
+    } else {
         for (int i = 0; i < nv; i++) {
-            const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
-            const int px = p->a[xi] - p->offx + c->offx, py = p->a[yi] - p->offy + c->offy;
-            a[xi] = (int32_t)floorf((float)px + (float)(c->a[xi] - px) * s_fg_t + 0.5f);
-            a[yi] = (int32_t)floorf((float)py + (float)(c->a[yi] - py) * s_fg_t + 0.5f);
+            a[kFgPos[op].xi[i]] -= (int)floorf(dx[i] * back + 0.5f);
+            a[kFgPos[op].yi[i]] -= (int)floorf(dy[i] * back + 0.5f);
         }
     }
-emit:
     switch (op) {
     case FG_FT:  vkb_draw_flat_triangle(a[0],a[1],a[2],a[3],a[4],a[5],(uint16_t)a[6]); break;
     case FG_GT:  vkb_draw_gouraud_triangle(a[0],a[1],(uint16_t)a[2],a[3],a[4],(uint16_t)a[5],a[6],a[7],(uint16_t)a[8]); break;
@@ -5264,6 +5037,47 @@ emit:
     }
 }
 
+/* Replay state commands into the generated picture. Returns 0 for a primitive. */
+static int fg_replay_state(const FgCmd *c, int clears) {
+    switch (c->op) {
+    case FG_SEMI: vkb_set_semi_transparency(c->a[0], c->a[1]); return 1;
+    case FG_MASK: vkb_set_mask_bits(c->a[0], c->a[1]); return 1;
+    case FG_TWIN: vkb_set_texture_window((uint32_t)c->a[0]); return 1;
+    case FG_MOD:  vkb_set_color_modulation(c->a[0], c->a[1], c->a[2], c->a[3]); return 1;
+    case FG_DA:   vkb_set_draw_area(c->a[0], c->a[1], c->a[2], c->a[3]); return 1;
+    case FG_OFF:  vkb_set_draw_offset(c->a[0], c->a[1]); return 1;
+    case FG_VIEW: vkb_wide_set_view(c->a[0], c->a[1], c->a[2], c->a[3]); return 1;
+    case FG_WSET:
+        flush_tex_batch(); flush_geometry();
+        s_wide_cur = s_fg_surf; s_wide_cur_base = c->a[0];
+        return 1;
+    case FG_WDIS:
+        flush_tex_batch(); flush_geometry();
+        s_wide_cur = -1;
+        return 1;
+    case FG_WCLR:  if (clears) vkb_wide_clear(c->a[0], c->a[1], c->a[2], (uint16_t)c->a[3]); return 1;
+    case FG_WCLRM: if (clears) vkb_wide_clear_margins(c->a[0], c->a[1], c->a[2], (uint16_t)c->a[3], c->a[4]); return 1;
+    default: return 0;
+    }
+}
+/* The game draws just enough sky and sea to fill the screen. Shifting that
+ * layer back uncovers a strip along the edge it came from, black in every
+ * other picture. Lay the new frame's opaque backdrop down unshifted first:
+ * the strip then shows sea, and everything else is drawn over. */
+static void fg_underpaint(const FgList *cur, int from) {
+    FgState at; fg_state_get(&at);
+    const int wide = s_wide_cur, base = s_wide_cur_base;
+    for (int i = from; i < cur->n; i++) {
+        const FgCmd *c = &cur->c[i];
+        if (fg_replay_state(c, 0)) continue;
+        if (!fg_is_backdrop(c) || !fg_is_textured(c->op)) break;      /* the layer comes first, in one run */
+        if (!s_semi_en) fg_emit(c, NULL, 1);
+    }
+    flush_tex_batch(); flush_geometry();
+    fg_state_set(&at);
+    s_wide_cur = wide; s_wide_cur_base = base;
+}
+
 /* Render the picture halfway between `prev` and `cur` into the private wide
  * surface. Returns 1 when it was drawn. */
 static int fg_build(FgList *prev, FgList *cur, int k, float t) {
@@ -5273,7 +5087,6 @@ static int fg_build(FgList *prev, FgList *cur, int k, float t) {
     s_fg_surf = s_fg_surfs[k];
     if (s_fg_surf < 0) return 0;
     s_fg_t = t;
-    fg_backdrop_shift(prev, cur);
 
     FgState live;
     fg_state_get(&live);
@@ -5286,30 +5099,12 @@ static int fg_build(FgList *prev, FgList *cur, int k, float t) {
     fg_state_set(&cur->init);
     s_wide_cur = cur->init.wide_on ? s_fg_surf : -1;
     s_wide_cur_base = cur->init.wide_base;
+    int under = s_fg_bd_have && (fabsf(s_fg_bd_dx) > 0.01f || fabsf(s_fg_bd_dy) > 0.01f);
     for (int i = 0; i < cur->n; i++) {
         const FgCmd *c = &cur->c[i];
-        switch (c->op) {
-        case FG_SEMI: vkb_set_semi_transparency(c->a[0], c->a[1]); break;
-        case FG_MASK: vkb_set_mask_bits(c->a[0], c->a[1]); break;
-        case FG_TWIN: vkb_set_texture_window((uint32_t)c->a[0]); break;
-        case FG_MOD:  vkb_set_color_modulation(c->a[0], c->a[1], c->a[2], c->a[3]); break;
-        case FG_DA:   vkb_set_draw_area(c->a[0], c->a[1], c->a[2], c->a[3]); break;
-        case FG_OFF:  vkb_set_draw_offset(c->a[0], c->a[1]); break;
-        case FG_VIEW: vkb_wide_set_view(c->a[0], c->a[1], c->a[2], c->a[3]); break;
-        case FG_WSET:
-            flush_tex_batch(); flush_geometry();
-            s_wide_cur = s_fg_surf; s_wide_cur_base = c->a[0];
-            break;
-        case FG_WDIS:
-            flush_tex_batch(); flush_geometry();
-            s_wide_cur = -1;
-            break;
-        case FG_WCLR:  vkb_wide_clear(c->a[0], c->a[1], c->a[2], (uint16_t)c->a[3]); break;
-        case FG_WCLRM: vkb_wide_clear_margins(c->a[0], c->a[1], c->a[2], (uint16_t)c->a[3], c->a[4]); break;
-        default:
-            fg_emit(c, c->used && c->next >= 0 ? &prev->c[c->next] : NULL);
-            break;
-        }
+        if (fg_replay_state(c, 1)) continue;
+        if (under && fg_is_backdrop(c) && fg_is_textured(c->op)) { under = 0; fg_underpaint(cur, i); }
+        fg_emit(c, c->used && c->next >= 0 ? &prev->c[c->next] : NULL, 0);
     }
     flush_tex_batch(); flush_geometry();
     s_fg_replay = 0;
@@ -5349,29 +5144,10 @@ void vk_renderer_display_flip(void) {
     s_fg_hold = 0;
     if (s_wide_w > 0 && !cur->overflow && !prev->overflow &&
         cur->wide_prims >= 24 && prev->wide_prims >= 24) {
-        int matched = fg_match(prev, cur, 0.0f, 0.0f);
-        {
-            /* Repeated surfaces (a wall or waterfall drawn as many pieces
-             * with one texture cut-out) pair with the wrong neighbour once
-             * the camera moves more than half a piece per frame. Most of the
-             * picture moves with the camera, so pair again around the motion
-             * the first pass found for the frame as a whole. */
-            static float mx[FG_MAX_CMDS], my[FG_MAX_CMDS];
-            int n = 0;
-            for (int i = 0; i < cur->n; i++) {
-                const FgCmd *c = &cur->c[i];
-                if (c->op < FG_FIRST_PRIM || !c->used || c->next < 0 || fg_is_backdrop(c)) continue;
-                float cx, cy, px, py;
-                fg_centre(c, &cx, &cy); fg_centre(&prev->c[c->next], &px, &py);
-                mx[n] = cx - px; my[n] = cy - py; n++;
-            }
-            if (n >= 16 && !getenv("PSX_VK_FG_NO_REMATCH")) {
-                const float gx = fg_median(mx, n), gy = fg_median(my, n);
-                if (fabsf(gx) > 1.0f || fabsf(gy) > 1.0f) matched = fg_match(prev, cur, gx, gy);
-            }
-        }
-        fg_regularize(prev, cur);
-        if (!getenv("PSX_VK_FG_NO_ORPHANS")) fg_orphans(prev, cur);
+        int matched = fg_solve(prev, cur);
+        matched += fg_solve_backdrop(prev, cur);
+        for (int i = 0; i < cur->n; i++)
+            if (cur->c[i].op >= FG_FIRST_PRIM && !fg_is_backdrop(&cur->c[i])) s_fg_stat_how[cur->c[i].how]++;
         s_fg_stat_prims += (unsigned)cur->prims; s_fg_stat_matched += (unsigned)matched;
         const int mode = fg_enabled();
         const int want = (mode >= 2 && fg_120_ok()) ? (mode == 2 ? 2 : 3) : 1;
@@ -5389,15 +5165,19 @@ void vk_renderer_display_flip(void) {
         fg_csv(cur, matched, made == want);
     }
     if (s_fg_stat_flips >= 300) {
-        fprintf(stdout, "psxrecomp: vulkan: frame generation: %u of %u frames got an in-between picture, %u%% of primitives matched, %u orphans/frame (%u by corners, %u by neighbour) (last frame: %d cmds, %d prims, %d wide; wide_w %d)\n",
-                s_fg_stat_made, s_fg_stat_flips,
+        const unsigned nf = s_fg_stat_flips;
+        fprintf(stdout, "psxrecomp: vulkan: frame generation: %u of %u frames got an in-between picture, %u%% of primitives matched; "
+                        "per frame: camera %u, anchors %u, mesh %u, whole mesh %u, scrolled %u, corners %u, guessed %u "
+                        "(camera fit %d of %d; last frame: %d cmds, %d prims, %d wide; wide_w %d)\n",
+                s_fg_stat_made, nf,
                 s_fg_stat_prims ? (unsigned)((uint64_t)s_fg_stat_matched * 100u / s_fg_stat_prims) : 0u,
-                s_fg_stat_orph / (s_fg_stat_flips ? s_fg_stat_flips : 1u), s_fg_stat_orph_vert / (s_fg_stat_flips ? s_fg_stat_flips : 1u),
-                s_fg_stat_orph_near / (s_fg_stat_flips ? s_fg_stat_flips : 1u),
-                cur->n, cur->prims, cur->wide_prims, s_wide_w);
+                s_fg_stat_how[FG_HOW_CAMERA] / nf, (s_fg_stat_how[FG_HOW_ANCHOR] + s_fg_stat_how[FG_HOW_STILL]) / nf,
+                s_fg_stat_how[FG_HOW_MESH] / nf, s_fg_stat_how[FG_HOW_SEED] / nf, s_fg_stat_how[FG_HOW_LOOSE] / nf,
+                s_fg_stat_how[FG_HOW_CORNER] / nf, s_fg_stat_how[FG_HOW_FIELD] / nf,
+                s_fg_flow_last.inliers, s_fg_flow_last.n, cur->n, cur->prims, cur->wide_prims, s_wide_w);
         fflush(stdout);
         s_fg_stat_flips = s_fg_stat_made = s_fg_stat_prims = s_fg_stat_matched = 0;
-        s_fg_stat_orph = s_fg_stat_orph_vert = s_fg_stat_orph_near = 0;
+        memset(s_fg_stat_how, 0, sizeof s_fg_stat_how);
     }
     s_fg_cur ^= 1;                                /* cur becomes prev; old prev is reused */
     s_fg_list[s_fg_cur].n = s_fg_list[s_fg_cur].prims = s_fg_list[s_fg_cur].wide_prims = 0;

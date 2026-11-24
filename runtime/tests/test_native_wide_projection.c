@@ -102,6 +102,11 @@ int main(void) {
     assert(!gpu_triangle_rejected(wall_x,wall_y,0,1,2));
     prepare_precise_triangle(1,4,7,wall_x,wall_y);
     assert(fixture_triangle_recovered);
+    fixture_backend=GR_BACKEND_VULKAN;      /* clips like GL: same recovery */
+    assert(!gpu_triangle_rejected(wall_x,wall_y,0,1,2));
+    fixture_projections[1].z=0;
+    assert(gpu_triangle_rejected(wall_x,wall_y,0,1,2));
+    fixture_projections[1].z=900;
     fixture_backend=GR_BACKEND_SOFTWARE;
     assert(gpu_triangle_rejected(wall_x,wall_y,0,1,2));
     fixture_backend=GR_BACKEND_OPENGL;
@@ -158,6 +163,17 @@ int main(void) {
     assert(!native_wide_projective_draw());
     fixture_homogeneous[2].valid=1;fixture_backend=GR_BACKEND_SOFTWARE;
     assert(!native_wide_projective_draw());
+    /* Vulkan takes the same faces through its own clipped draw, and only
+     * while its wide target is up. */
+    fixture_backend=GR_BACKEND_VULKAN;
+    assert(!native_wide_projective_draw() && fixture_vk_projective_draws==0);
+    fixture_vk_projective_supported=1;
+    memset(fixture_projective_vertices,0,sizeof fixture_projective_vertices);
+    assert(native_wide_projective_draw() && fixture_vk_projective_draws==2);
+    assert(fixture_projective_vertices[1].z==-62 && fixture_projective_draws==2);
+    fixture_homogeneous[2].valid=0;
+    assert(!native_wide_projective_draw() && fixture_vk_projective_draws==2);
+    fixture_homogeneous[2].valid=1;fixture_vk_projective_supported=0;
     fixture_backend=GR_BACKEND_OPENGL;ws_cfg_num=4;ws_cfg_den=3;
     assert(!native_wide_projective_draw());
     configure_native_wide_16_9();fixture_projective_supported=0;

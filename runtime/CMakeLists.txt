@@ -2806,6 +2806,13 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
     target_include_directories(gpu_sw_edges_test PRIVATE src)
     add_test(NAME gpu_sw_edges_test COMMAND gpu_sw_edges_test)
 
+    add_executable(vk_framegen_match_test tests/test_vk_framegen_match.c)
+    target_include_directories(vk_framegen_match_test PRIVATE src)
+    if(NOT WIN32)
+        target_link_libraries(vk_framegen_match_test PRIVATE m)
+    endif()
+    add_test(NAME vk_framegen_match_test COMMAND vk_framegen_match_test)
+
     add_executable(gpu_uv_test tests/test_gpu_uv.c)
     target_include_directories(gpu_uv_test PRIVATE src)
     add_test(NAME gpu_uv_test COMMAND gpu_uv_test)

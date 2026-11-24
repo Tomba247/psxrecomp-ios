@@ -13,6 +13,9 @@
  * The backend supplies its vtable through vk_backend_get() (NULL until a context
  * is created and the pipeline is ready). */
 
+#include <stdint.h>
+#include "gpu_projective_clip.h"
+
 struct SDL_Window;
 
 #ifdef __cplusplus
@@ -57,6 +60,17 @@ void vk_renderer_set_display_aspect(int num, int den);
 /* GP1(05h) changed the displayed buffer: a guest frame is complete. Drives
  * 60 fps frame generation (in-between pictures); inert when that is off. */
 void vk_renderer_display_flip(void);
+
+/* Clipped draw of a proven projected face (GL twin: gl_renderer_draw_projected_
+ * triangle). Supported while the native-wide target is being drawn. */
+int  vk_renderer_projective_supported(void);
+void vk_renderer_draw_projected_triangle(const PSXProjectedVertex *vertices,
+                                         uint16_t texpage, uint16_t cx, uint16_t cy,
+                                         int raw, int semi, int perspective);
+
+/* Follows gr_set_perspective_triangle, whose weights are scaled to a maximum
+ * of 1: the factor that turns them back into 1 / camera depth. */
+void vk_renderer_set_triangle_depth_scale(float q);
 
 #ifdef __cplusplus
 }

@@ -10,9 +10,9 @@
  * Reference: PSX-SPX, page graphicsprocessingunitgpu (Graphics Processing Unit).
  */
 
-void vk_renderer_display_flip(void);   /* gpu_vk_renderer.c: frame generation */
 #include "gpu.h"
 #include "gpu_gl_renderer.h"
+#include "gpu_vk_renderer.h"
 #include "mod_texture_banks.h"
 #include "display_scanout.h"
 #include "pgxp.h"
@@ -5058,10 +5058,20 @@ int gpu_ws_native_wide_projection_correction(uint64_t *vertices) {
     return s_native_wide_projection_correction;
 }
 
+/* Backends whose triangles take sub-pixel corners and are clipped by the GPU,
+ * and can draw a face clipped in homogeneous space. */
+static int gpu_backend_clips(void) {
+    const int b = gr_backend();
+    return b == GR_BACKEND_OPENGL || b == GR_BACKEND_VULKAN;
+}
+static int gpu_backend_projective_supported(void) {
+    const int b = gr_backend();
+    return b == GR_BACKEND_OPENGL ? gl_renderer_projective_supported() :
+           b == GR_BACKEND_VULKAN ? vk_renderer_projective_supported() : 0;
+}
 static int gpu_ws_projective_enabled(void) {
     return pgxp_projection_tracking() && s_native_wide_projection_correction && ws_native_wide_active() &&
-        ws_nw_extra() > 0 && gr_backend() == GR_BACKEND_OPENGL &&
-        gl_renderer_projective_supported();
+        ws_nw_extra() > 0 && gpu_backend_projective_supported();
 }
 void psx_mod_set_native_wide_near_clip(int enabled) {
     /* Compatibility entry point: clipping follows projection correction.
@@ -5095,7 +5105,7 @@ static int native_wide_projection_x(uint32_t addr, uint32_t word,
 }
 
 /* Original, unsubdivided world faces can exceed the PS1 size limit after the
- * wider view admits them. Proven projected triangles use normal GL clipping,
+ * wider view admits them. Proven projected triangles use normal GPU clipping,
  * with the SAME geometry in canonical and wide passes: margin-only recovery
  * splits a face at the presentation center-copy edge. Missing/stale provenance,
  * depth behind the camera, saturated Y and UI retain the hardware reject. */
@@ -5103,7 +5113,7 @@ static int gpu_triangle_rejected(const int32_t* x, const int32_t* y,
                                  int a, int b, int c) {
     if (!psx_gpu_triangle_oversize(x, y, a, b, c)) return 0;
     if (!s_native_wide_projection_correction || !ws_native_wide_active() ||
-        ws_nw_extra() <= 0 || gr_backend() != GR_BACKEND_OPENGL ||
+        ws_nw_extra() <= 0 || !gpu_backend_clips() ||
         gp0_cmd_source_addr == UINT32_MAX) return 1;
     const uint32_t op = gp0_cmd_buf[0] >> 24;
     const unsigned stride = 1u + ((op & 4u) != 0) + ((op & 16u) != 0);
@@ -5325,6 +5335,7 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
     if (qmax <= 0.0f) { s_texcorr.no_depth++; return; }
     s_texcorr.armed++;
     gr_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
+    if (gr_backend() == GR_BACKEND_VULKAN) vk_renderer_set_triangle_depth_scale(qmax);
 }
 
 /* Write a single pixel to VRAM with draw area clipping and mask bit handling */
@@ -5781,7 +5792,7 @@ static void setup_textured_draw(uint32_t color24, int semi_trans, int raw_textur
 /* A close corner may cross the camera plane while the face is still visible.
  * The hardware's clamped H/Z and unsigned SZ cannot describe that polygon.
  * Use only intact GTE-derived words, clip their signed homogeneous projection,
- * and submit through the normal ordered GL passes and VRAM authority path. */
+ * and submit through the backend's normal ordered passes and VRAM authority path. */
 static int native_wide_projective_draw(void) {
     const int render_projective = gpu_render_projective_enabled() &&
         gr_backend() == GR_BACKEND_OPENGL && gl_renderer_projective_supported();
@@ -5813,12 +5824,14 @@ static int native_wide_projective_draw(void) {
     const uint16_t tpage=gp0_cmd_buf[2+stride]>>16;
     set_tpage_from_poly(tpage);
     const int semi=(op&2u)?(int)semi_transparency:-1;
-    gl_renderer_draw_projected_triangle(vertices,tpage&0x1ff,
-        (clut&63)*16,(clut>>6)&511,op&1u,semi,render_projective || s_texture_correction_enabled);
-    if (n==4) {
-        const PSXProjectedVertex second[3]={vertices[2],vertices[1],vertices[3]};
-        gl_renderer_draw_projected_triangle(second,tpage&0x1ff,
-            (clut&63)*16,(clut>>6)&511,op&1u,semi,render_projective || s_texture_correction_enabled);
+    const int perspective=render_projective || s_texture_correction_enabled;
+    const int vulkan=gr_backend() == GR_BACKEND_VULKAN;
+    for (unsigned t=0;t<n-2u;++t) {
+        const PSXProjectedVertex tri[3]={vertices[t ? 2 : 0],vertices[1],vertices[t ? 3 : 2]};
+        if (vulkan) vk_renderer_draw_projected_triangle(tri,tpage&0x1ff,
+            (clut&63)*16,(clut>>6)&511,op&1u,semi,perspective);
+        else gl_renderer_draw_projected_triangle(tri,tpage&0x1ff,
+            (clut&63)*16,(clut>>6)&511,op&1u,semi,perspective);
     }
     return 1;
 }

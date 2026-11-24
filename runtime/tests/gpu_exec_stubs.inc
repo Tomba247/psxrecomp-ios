@@ -51,6 +51,17 @@ void gl_renderer_draw_projected_triangle(const PSXProjectedVertex v[3],
     fixture_projective_draws++;
     (void)tp;(void)cx;(void)cy;(void)raw;(void)semi;(void)perspective;
 }
+static int fixture_vk_projective_supported, fixture_vk_projective_draws;
+static float fixture_vk_depth_scale;
+int vk_renderer_projective_supported(void) { return fixture_vk_projective_supported; }
+void vk_renderer_draw_projected_triangle(const PSXProjectedVertex *v,
+    uint16_t tp, uint16_t cx, uint16_t cy, int raw, int semi, int perspective) {
+    memcpy(fixture_projective_vertices,v,sizeof fixture_projective_vertices);
+    fixture_vk_projective_draws++;
+    (void)tp;(void)cx;(void)cy;(void)raw;(void)semi;(void)perspective;
+}
+void vk_renderer_set_triangle_depth_scale(float q) { fixture_vk_depth_scale = q; }
+void vk_renderer_display_flip(void) {}
 static struct { uint32_t addr,word; PGXPProjection p; int valid; } fixture_homogeneous[4];
 int pgxp_load_projection(uint32_t addr, uint32_t word, PGXPProjection *out) {
     for(int i=0;i<4;++i) if(fixture_homogeneous[i].valid &&
