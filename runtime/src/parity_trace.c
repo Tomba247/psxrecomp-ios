@@ -1,6 +1,7 @@
 /* parity_trace.c — general two-process control-flow parity trace.
  * See parity_trace.h. Self-contained (no runtime internals) so the SAME TU
  * compiles into both psx-runtime and psx-beetle and they emit identical rows. */
+#include "psx_big.h"
 #include "parity_trace.h"
 #include "psx_bss.h"
 #include <string.h>
@@ -9,7 +10,7 @@
                                   * so the parked-thread1 divergence is in-window,
                                   * not just the wedge tail (~7.5 MB ring). */
 
-static PSX_BSS ParityEntry s_ring[PARITY_RING_CAP];
+PSX_BIG(static, ParityEntry, s_ring, PARITY_RING_CAP)
 static uint64_t    s_seq      = 0;
 uint32_t g_parity_trace_armed = 0;
 static uint32_t    s_frozen   = 0;
@@ -33,7 +34,7 @@ static uint32_t    s_last_current_tcb = 0; /* writer-TCB attribution for note_wr
  * Each row carries reader provenance (pc/cycle/frame + addr in epc, value in target
  * & the matched watch slot) AND the current last-WRITER metadata for that slot, so
  * a single read row answers "who read what value, that whom last wrote". */
-static PSX_BSS ParityEntry s_rring[PARITY_RING_CAP];
+PSX_BIG(static, ParityEntry, s_rring, PARITY_RING_CAP)
 static uint64_t    s_rseq = 0;
 
 /* Frame + guest-cycle stamps: each host process defines these accessors
@@ -62,8 +63,8 @@ void parity_trace_config(uint32_t watched_tcb, uint32_t trigger_target,
 
 void parity_trace_arm(int on)        { g_parity_trace_armed = on ? 1u : 0u; }
 void parity_trace_reset(void)        {
-    s_seq = 0; s_frozen = 0; memset(s_ring, 0, sizeof(s_ring));
-    s_rseq = 0; memset(s_rring, 0, sizeof(s_rring));
+    s_seq = 0; s_frozen = 0; memset(s_ring, 0, sizeof(*s_ring) * PARITY_RING_CAP);
+    s_rseq = 0; memset(s_rring, 0, sizeof(*s_rring) * PARITY_RING_CAP);
     for (int i = 0; i < PARITY_WATCH_MAX; i++) {
         s_wpc[i] = 0; s_wcycle[i] = 0; s_wframe[i] = 0; s_wtcb[i] = 0;
     }

@@ -7,6 +7,9 @@
  * VRAM at each vblank via callback from gpu_vblank_tick().
  */
 
+#include <cxxabi.h>
+#include <exception>
+#include <typeinfo>
 #include "cpu_state.h"
 #include "mod_netplay.h"
 #include "netplay_host_startup.hpp"
@@ -10315,6 +10318,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
         headless_present_image_ring_capture();
 #endif
+        if (g_vk_active) {      /* PSX_VK_HEADLESS: one present per vblank, as with a window */
+            GpuDisplayInfo hd;
+            gpu_get_display_info(&hd);
+            if (!hd.disabled && hd.width && hd.height && !hd.depth24 && g_ws_engaged &&
+                gpu_ws_present_native_43() == 0 && ws_native_wide_active() && gr_wide_supported())
+                (void)vk_renderer_present_wide((int)hd.display_x, (int)hd.display_y, (int)hd.height, 0);
+        }
         ep.skip_pace = 1;
         return ep;
     }
@@ -21962,7 +21972,9 @@ session_reboot:
          * the fallback; an unavailable OpenGL backend reverts to software.
          * Ordinary headless has no context and uses software. The explicit
          * hidden-OpenGL mode creates a context below and refuses fallback. */
-        const int backend_renderer = g_headless && !g_headless_opengl ? 0 : g_video_renderer;
+        const bool headless_vk = g_headless && !g_headless_opengl && std::getenv("PSX_VK_HEADLESS");
+        if (headless_vk) g_video_renderer = 2;
+        const int backend_renderer = g_headless && !g_headless_opengl && !headless_vk ? 0 : g_video_renderer;
         gr_set_backend(backend_renderer == 2 ? GR_BACKEND_VULKAN :
                        backend_renderer == 1 ? GR_BACKEND_OPENGL :
                                                GR_BACKEND_SOFTWARE);
@@ -22537,6 +22549,27 @@ session_reboot:
         std::fprintf(stdout, "psxrecomp: hidden OpenGL headless enabled (backend=opengl hidden=1 audio=0 controllers=0)\n");
     } else {
         std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
+        if (gr_backend() == GR_BACKEND_VULKAN) {
+            /* Diagnostic run only: name what ends the program. */
+            std::set_terminate([] {
+                const std::type_info *t = abi::__cxa_current_exception_type();
+                std::fprintf(stdout, "psxrecomp: headless vulkan: terminate, exception type %s\n", t ? t->name() : "(none)");
+                std::fflush(stdout);
+                std::abort();
+            });
+            try {
+                g_vk_active = vk_renderer_init_context(nullptr) != 0;
+            } catch (...) {
+                const std::type_info *t = abi::__cxa_current_exception_type();
+                std::fprintf(stdout, "psxrecomp: headless vulkan: caught exception type %s\n", t ? t->name() : "(unknown)");
+                std::fflush(stdout);
+                throw;
+            }
+            if (!g_vk_active) gr_set_backend(GR_BACKEND_SOFTWARE);
+            g_video_scale = gr_scale();
+            std::fprintf(stdout, "psxrecomp: headless vulkan %s\n", g_vk_active ? "ready" : "FAILED");
+            std::fflush(stdout);
+        }
     }
   } else {
     /* ---- SDL init ---- */

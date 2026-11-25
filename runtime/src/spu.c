@@ -16,6 +16,7 @@
  * oracle comparison can quantify them from OUTPUT, not source.
  */
 
+#include "psx_big.h"
 #include "spu.h"
 #include "spu_gauss.h"
 #include "spu_shadow.h"
@@ -140,7 +141,7 @@ extern uint64_t s_frame_count;
  * a few hundred audible-voice events per chime second; recomp at <1k total
  * per chime. 1M gives ~minutes of headroom for game-scene capture too. */
 #define SPU_EVENT_CAP (1u << 20)
-static SpuEvent  s_events[SPU_EVENT_CAP];
+PSX_BIG(static, SpuEvent, s_events, SPU_EVENT_CAP)
 static uint32_t  s_event_idx = 0;
 static uint64_t  s_event_seq = 0;
 
@@ -1173,7 +1174,7 @@ void spu_init(void) {
     memset(private_regs,0,sizeof private_regs);memset(private_modes,0,sizeof private_modes);
     memset(private_owners,0,sizeof private_owners);
     private_enabled=0;
-    memset(s_events, 0, sizeof(s_events));
+    memset(s_events, 0, sizeof(*s_events) * SPU_EVENT_CAP);
     transfer_addr = 0;
     key_on_count = 0;
     render_frames = 0;
@@ -2006,7 +2007,7 @@ uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
 void spu_event_reset(void) {
     s_event_idx = 0;
     s_event_seq = 0;
-    memset(s_events, 0, sizeof(s_events));
+    memset(s_events, 0, sizeof(*s_events) * SPU_EVENT_CAP);
 }
 
 /* ---- boot snapshot: complete SPU register + voice state (LE field wire) ---- */

@@ -70,6 +70,7 @@ const GpuRenderBackend *vk_backend_get(void) { return 0; }
 #endif
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include <dlfcn.h>
 #include "vk_shaders_spv.h"   /* generated: spv_geo_vert/frag, spv_geo_tex_vert/frag,
                                *            spv_pack_comp, spv_blit_vert/frag */
 
@@ -342,6 +343,7 @@ static VkImageLayout   s_up_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 static VkImage        s_wide_img[VK_WIDE_MAX_SURF];
 static VkDeviceMemory s_wide_mem[VK_WIDE_MAX_SURF];
 static VkImageView    s_wide_view[VK_WIDE_MAX_SURF];
+static unsigned       s_wide_depth_stamp[VK_WIDE_MAX_SURF];   /* flip count + 1 of the last depth clear */
 static VkImage        s_wide_ds_img[VK_WIDE_MAX_SURF];
 static VkDeviceMemory s_wide_ds_mem[VK_WIDE_MAX_SURF];
 static VkImageView    s_wide_ds_view[VK_WIDE_MAX_SURF];
@@ -611,7 +613,21 @@ static VkPipeline       s_pipe_pack;      /* compute */
 #define PIPE_STENCILS 3
 #define PIPE_CMASKS 2
 #define PIPE_CACHE_N (PIPE_PROGS * PIPE_TOPOS * PIPE_BLENDS * PIPE_STENCILS * PIPE_CMASKS)
-static VkPipeline s_pipe_cache[PIPE_CACHE_N * 2];   /* [single-sample | MSAA] */
+static VkPipeline s_pipe_cache[PIPE_CACHE_N * 4];   /* [single-sample | MSAA] x [order | depth] */
+/* Depth sorting (PSX_VK_DEPTH=1, off by default): opaque textured triangles
+ * with a proven camera depth are tested against a reversed depth buffer
+ * (1 / camera depth) of the wide picture. Everything else keeps draw order. */
+static int s_pipe_depth;
+static int vk_depth_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PSX_VK_DEPTH"); on = e && *e && *e != '0'; }
+    return on;
+}
+static float vk_depth_near(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) { const char *e = getenv("PSX_VK_DEPTH_NEAR"); v = e && *e ? (float)atof(e) : 1024.0f; if (v < 2.0f) v = 2.0f; }
+    return v;
+}
 static VkShaderModule s_mod_geo_v, s_mod_geo_f, s_mod_tex_v, s_mod_tex_f, s_mod_blit_v, s_mod_blit_f;
 
 /* Untextured batch (flat/gouraud triangles, lines-as-quads, flat rects). */
@@ -656,6 +672,7 @@ static uint32_t       s_tcount;
 static uint32_t       s_tbase;            /* first vertex of the open batch */
 static int            s_tb_semi = -2, s_tb_mask = 0, s_tb_check = 0, s_tb_filter = 0;
 static int            s_tb_twin[4] = {0,0,0,0};
+static int            s_tb_depth;          /* open batch is depth sorted */
 
 static void flush_geometry(void);         /* commit pending untextured batch */
 static void flush_tex_batch(void);        /* commit pending textured batch */
@@ -861,7 +878,7 @@ static void flush_work(void) {
 /* Start the GPU on what is recorded so far, without waiting for it. */
 static void submit_ahead(void) {
 #ifdef PSX_IOS
-    psx_ios_wait_foreground();
+    if (s_win) psx_ios_wait_foreground();
 #endif
     if (s_work_cb) s_work_pending = 1;
     flush_work();
@@ -1003,10 +1020,19 @@ static int load_device_funcs(void) {
 }
 
 /* ---- instance / device / swapchain ------------------------------------- */
+/* Diagnostic: PSX_VK_HEADLESS=<path of the Vulkan library> renders without a
+ * window (--headless), into a VK_EXT_headless_surface. */
+static const char *vk_headless_lib(void) {
+    const char *e = getenv("PSX_VK_HEADLESS");
+    return !s_win && e && *e ? e : NULL;
+}
 static int create_instance(void) {
     unsigned ext_count = 0;
 #if defined(PSX_SDL3)
-    const char *const *sdl_exts = SDL_Vulkan_GetInstanceExtensions(&ext_count);
+    static const char *const headless_exts[] = { "VK_KHR_surface", "VK_EXT_headless_surface" };
+    const char *const *sdl_exts = headless_exts;
+    if (vk_headless_lib()) ext_count = 2;
+    else sdl_exts = SDL_Vulkan_GetInstanceExtensions(&ext_count);
     if (!sdl_exts)
         return vk_die("SDL_Vulkan_GetInstanceExtensions failed");
     const char *exts[16];
@@ -1123,6 +1149,7 @@ static int create_swapchain(void) {
 #endif
         ext.width = (uint32_t)w; ext.height = (uint32_t)h;
     }
+    if (vk_headless_lib()) { ext.width = 1280; ext.height = 720; }
     s_sc_extent = ext;
 
     uint32_t img_count = caps.minImageCount + 1;
@@ -1279,12 +1306,13 @@ static VkFormat choose_ds_format(void) {
     {
         const char *e = getenv("PSX_VK_STENCIL_ONLY");
         VkFormatProperties fp; p_vkGetPhysicalDeviceFormatProperties(s_phys, VK_FORMAT_S8_UINT, &fp);
-        if ((!e || *e != '0') && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+        if (!vk_depth_on() && (!e || *e != '0') && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
             s_ds_aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
             return VK_FORMAT_S8_UINT;
         }
     }
     VkFormat cand[2] = { VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT };
+    if (vk_depth_on()) { cand[0] = VK_FORMAT_D32_SFLOAT_S8_UINT; cand[1] = VK_FORMAT_D24_UNORM_S8_UINT; }
     for (int i = 0; i < 2; i++) {
         VkFormatProperties fp; p_vkGetPhysicalDeviceFormatProperties(s_phys, cand[i], &fp);
         if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
@@ -1312,6 +1340,39 @@ static int create_buffer_mapped(VkDeviceSize size, VkBuffer *buf, VkDeviceMemory
 
 /* Build all render targets, samplers, descriptors, pipeline layouts and the
  * pack compute pipeline. Graphics pipelines are built lazily by get_pipeline. */
+static void vk_stage(const char *what) {   /* PSX_VK_HEADLESS only: how far init got */
+    if (!vk_headless_lib()) return;
+    fprintf(stdout, "psxrecomp: vulkan: stage: %s\n", what); fflush(stdout);
+}
+/* geo_tex.vert ends in vec4(ndc * w, 0.0, w). With z = 1.0 the depth becomes
+ * 1 / w. Find that one construction (third member the constant 0.0) and the
+ * constant 1.0 of the same type; anything else leaves the module as it is. */
+static VkShaderModule make_depth_tex_module(void) {
+    const uint32_t n = spv_geo_tex_vert_size / 4u;
+    uint32_t zero = 0, one = 0, ftype = 0, at = 0, found = 0;
+    for (uint32_t i = 5; i < n && (spv_geo_tex_vert[i] >> 16); i += spv_geo_tex_vert[i] >> 16) {
+        const uint32_t *w = spv_geo_tex_vert + i;
+        if ((w[0] & 0xFFFFu) == 22u && w[2] == 32u) ftype = w[1];          /* OpTypeFloat 32 */
+        if ((w[0] & 0xFFFFu) == 43u && w[1] == ftype && w[3] == 0u) zero = w[2];
+        if ((w[0] & 0xFFFFu) == 43u && w[1] == ftype && w[3] == 0x3F800000u) one = w[2];
+    }
+    for (uint32_t i = 5; zero && one && i < n && (spv_geo_tex_vert[i] >> 16); i += spv_geo_tex_vert[i] >> 16) {
+        const uint32_t *w = spv_geo_tex_vert + i;
+        if (w[0] == ((7u << 16) | 80u) && w[5] == zero) { at = i + 5; found++; }   /* OpCompositeConstruct vec4 */
+    }
+    if (found != 1) {
+        fprintf(stdout, "psxrecomp: vulkan: depth sorting: shader not as expected, left alone\n");
+        return make_module(spv_geo_tex_vert, spv_geo_tex_vert_size);
+    }
+    uint32_t *copy = (uint32_t *)malloc(spv_geo_tex_vert_size);
+    if (!copy) return VK_NULL_HANDLE;
+    memcpy(copy, spv_geo_tex_vert, spv_geo_tex_vert_size);
+    copy[at] = one;
+    VkShaderModule m = make_module(copy, spv_geo_tex_vert_size);
+    free(copy);
+    fprintf(stdout, "psxrecomp: vulkan: depth sorting on\n");
+    return m;
+}
 static int create_render_targets(void) {
     int S = s_scale;
 
@@ -1378,6 +1439,7 @@ static int create_render_targets(void) {
     att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     att[1].format = s_ds_format; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
     att[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    if (vk_depth_on()) { att[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE; }
     att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD; att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -1480,6 +1542,7 @@ static int create_render_targets(void) {
         p_vkUpdateDescriptorSets(s_dev, 3, w, 0, NULL);
     }
 
+    vk_stage("pipeline layouts + hd textures");
     /* Pipeline layouts. */
     {
         VkPushConstantRange pr;
@@ -1499,16 +1562,18 @@ static int create_render_targets(void) {
         if (p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_pl_pack) != VK_SUCCESS) return vk_die("pl pack");
     }
 
+    vk_stage("shader modules");
     /* Shader modules (kept for lazy graphics-pipeline creation). */
     s_mod_geo_v  = make_module(spv_geo_vert, spv_geo_vert_size);
     s_mod_geo_f  = make_module(spv_geo_frag, spv_geo_frag_size);
-    s_mod_tex_v  = make_module(spv_geo_tex_vert, spv_geo_tex_vert_size);
+    s_mod_tex_v  = vk_depth_on() ? make_depth_tex_module() : make_module(spv_geo_tex_vert, spv_geo_tex_vert_size);
     s_mod_tex_f  = make_module(spv_geo_tex_frag, spv_geo_tex_frag_size);
     s_mod_blit_v = make_module(spv_blit_vert, spv_blit_vert_size);
     s_mod_blit_f = make_module(spv_blit_frag, spv_blit_frag_size);
     if (!s_mod_geo_v || !s_mod_geo_f || !s_mod_tex_v || !s_mod_tex_f || !s_mod_blit_v || !s_mod_blit_f)
         return vk_die("shader module failed");
 
+    vk_stage("pack compute pipeline");
     /* Pack compute pipeline. */
     {
         VkShaderModule cm = make_module(spv_pack_comp, spv_pack_comp_size);
@@ -1522,12 +1587,15 @@ static int create_render_targets(void) {
         if (r != VK_SUCCESS) return vk_die("pack pipeline failed");
     }
 
+    vk_stage("vertex buffers");
     /* Vertex buffers (untextured + textured). */
     if (!create_buffer_mapped((VkDeviceSize)VK_VBUF_VERTS * sizeof(Vert),
                               &s_vbuf, &s_vbuf_mem, (void**)&s_vmap)) return 0;
     if (!create_buffer_mapped((VkDeviceSize)VK_TBUF_VERTS * sizeof(TexVert),
                               &s_tbuf, &s_tbuf_mem, (void**)&s_tmap)) return 0;
+    vk_stage("first GPU submit");
     gpu_sync();   /* complete the init clears (VRAM/raw/stencil) before any frame */
+    vk_stage("first GPU submit done");
     s_ready = 1;
     /* CPU VRAM writes made before the context existed (facade routed to us
      * since gr_init, s_ready was 0) accumulated only in the CPU array — seed
@@ -1545,6 +1613,7 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
               * PIPE_CMASKS + cmask;
     const int msp = s_pipe_ms && s_msaa > 1;
     if (msp) key += PIPE_CACHE_N;
+    if (s_pipe_depth) key += 2 * PIPE_CACHE_N;
     if (s_pipe_cache[key]) return s_pipe_cache[key];
 
     VkShaderModule vs, fs; VkPipelineLayout layout;
@@ -1640,7 +1709,9 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
     else if (stencil == 1) { st.compareOp = VK_COMPARE_OP_EQUAL;  st.failOp = VK_STENCIL_OP_KEEP; st.passOp = VK_STENCIL_OP_KEEP;    st.depthFailOp = VK_STENCIL_OP_KEEP; }
     else                   { st.compareOp = VK_COMPARE_OP_EQUAL;  st.failOp = VK_STENCIL_OP_KEEP; st.passOp = VK_STENCIL_OP_INVERT;  st.depthFailOp = VK_STENCIL_OP_KEEP; }
     VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    dss.depthTestEnable = VK_FALSE; dss.depthWriteEnable = VK_FALSE;
+    dss.depthTestEnable = s_pipe_depth ? VK_TRUE : VK_FALSE;
+    dss.depthWriteEnable = s_pipe_depth ? VK_TRUE : VK_FALSE;
+    dss.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;   /* reversed: nearer is larger */
     dss.stencilTestEnable = VK_TRUE; dss.front = st; dss.back = st;
 
     VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
@@ -1677,6 +1748,11 @@ static inline uint16_t rgba8_to_rgb555(const uint8_t in[4]) {
 
 int vk_renderer_init_context(SDL_Window *win) {
     s_win = win;
+    if (vk_headless_lib()) {
+        void *lib = dlopen(vk_headless_lib(), RTLD_NOW | RTLD_LOCAL);
+        if (!lib) return vk_die("headless: cannot load the Vulkan library");
+        p_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
+    } else {
 #if defined(PSX_SDL3)
     if (!SDL_Vulkan_LoadLibrary(NULL))
 #else
@@ -1685,11 +1761,19 @@ int vk_renderer_init_context(SDL_Window *win) {
         return vk_die("SDL_Vulkan_LoadLibrary failed (no Vulkan ICD?)");
     p_vkGetInstanceProcAddr =
         (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
+    }
     if (!p_vkGetInstanceProcAddr) return vk_die("no vkGetInstanceProcAddr from SDL");
 
     if (!load_global_funcs()) return 0;
     if (!create_instance()) return 0;
     if (!load_instance_funcs()) return 0;
+    if (vk_headless_lib()) {
+        PFN_vkCreateHeadlessSurfaceEXT mk = (PFN_vkCreateHeadlessSurfaceEXT)
+            p_vkGetInstanceProcAddr(s_instance, "vkCreateHeadlessSurfaceEXT");
+        VkHeadlessSurfaceCreateInfoEXT hi = { VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
+        if (!mk || mk(s_instance, &hi, NULL, &s_surface) != VK_SUCCESS)
+            return vk_die("headless surface failed");
+    } else
 #if defined(PSX_SDL3)
     if (!SDL_Vulkan_CreateSurface(s_win, s_instance, NULL, &s_surface))
 #else
@@ -1734,7 +1818,7 @@ void vk_renderer_shutdown(void) {
             staging_destroy(s_staging_cache[i].buf, s_staging_cache[i].mem);
     }
     wide_free_all();          /* native-wide surfaces (color + DS + framebuffers) */
-    for (int i = 0; i < PIPE_CACHE_N * 2; i++)
+    for (int i = 0; i < PIPE_CACHE_N * 4; i++)
         if (s_pipe_cache[i]) p_vkDestroyPipeline(s_dev, s_pipe_cache[i], NULL);
     if (s_pipe_pack)   p_vkDestroyPipeline(s_dev, s_pipe_pack, NULL);
     if (s_mod_geo_v)   p_vkDestroyShaderModule(s_dev, s_mod_geo_v, NULL);
@@ -1798,7 +1882,7 @@ void vk_renderer_set_present_mode(int mode) { s_present_mode_req = mode; }
 static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
                            uint32_t *out_idx, uint32_t *out_frame) {
 #ifdef PSX_IOS
-    psx_ios_wait_foreground();
+    if (s_win) psx_ios_wait_foreground();
 #endif
     uint32_t fr = s_frame_idx % VK_FRAMES;
     p_vkWaitForFences(s_dev, 1, &s_fence[fr], VK_TRUE, UINT64_MAX);
@@ -3653,6 +3737,14 @@ static void wide_pass_begin_surf(VkCommandBuffer cb, int i, int wide_w) {
     p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
     VkViewport vp = { 0.f, 0.f, (float)(wide_w * S), (float)(VRAM_H * S), 0.f, 1.f };
     p_vkCmdSetViewport(cb, 0, 1, &vp);
+    if (vk_depth_on() && s_wide_depth_stamp[i] != s_flip_count + 1u) {
+        /* First pass into this surface since the flip: nothing drawn yet. */
+        s_wide_depth_stamp[i] = s_flip_count + 1u;
+        VkClearAttachment dc = {0};
+        dc.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        VkClearRect dr = { { { 0, 0 }, { (uint32_t)(wide_w * S), (uint32_t)(VRAM_H * S) } }, 0, 1 };
+        p_vkCmdClearAttachments(cb, 1, &dc, 1, &dr);
+    }
 }
 static void wide_scissor(VkCommandBuffer cb, int wide_w, int da_y1, int da_y2, int pad_l, int pad_r) {
     int S = s_scale;
@@ -3680,6 +3772,7 @@ typedef struct {
     TexPush  tp;
     VkDescriptorSet hd_ds;
     uint8_t stencil_fix;
+    uint8_t depth;               /* opaque batch with camera depths */
 } WideRec;
 #define WQ_MAX 4096
 static WideRec s_wq[WQ_MAX];
@@ -3699,6 +3792,7 @@ static WideRec *wq_push(int tex, int semi, int check, int mask, uint32_t base, u
     r->y1 = (int16_t)s_da_y1; r->y2 = (int16_t)s_da_y2;
     r->pad_l = (int16_t)view_pad_left; r->pad_r = (int16_t)view_pad_right;
     r->base = base; r->n = n;
+    r->depth = 0;
     return r;
 }
 static void pass_close(void) {
@@ -3739,12 +3833,14 @@ static void pass_close(void) {
         p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
         TexPush tp = r->tp;
         if (r->semi < 0) {
+            s_pipe_depth = r->depth;
             bind_masked(cb, 1, 0, 0, r->check, r->mask);
             tp.semipass = 0;
             p_vkCmdPushConstants(cb, s_pl_tex, TS, 0, sizeof tp, &tp);
             p_vkCmdDraw(cb, r->n, 1, r->base, 0);
-            if (!r->stencil_fix) continue;
+            if (!r->stencil_fix) { s_pipe_depth = 0; continue; }
             bind_masked_stencil_only(cb, 1, 0, r->check, 1);
+            s_pipe_depth = 0;
         } else {
             bind_masked(cb, 1, 0, 0, r->check, r->mask);
             tp.semipass = 1;
@@ -4058,6 +4154,7 @@ static void flush_tex_batch(void) {
         WideRec *r = wq_push(1, semi, s_tb_check, s_tb_mask, base, n);
         wide_xform(s_tb_gate, &tp.xoff, &tp.xhalf);
         r->tp = tp; r->hd_ds = s_tb_hd_ds; r->stencil_fix = (uint8_t)fix;
+        r->depth = (uint8_t)(semi < 0 && s_tb_depth);
     }
     end_oneshot(cb);
     s_gpu_dirty = 1;
@@ -4423,6 +4520,43 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     if (s_mask_check) { s_mask_check_ever = 1; s_mask_check_flip = s_flip_count; }
     int isolate = (semi >= 0);
     const int gate = vk_bd_gate(1, 0);
+    /* Absolute weights for a depth-sorted triangle: w becomes the camera depth.
+     * One factor for all three corners, so texturing is unchanged. Later
+     * triangles of a frame get up to 2% nearer, so a face drawn on purpose
+     * over a coplanar one still wins. */
+    float q_scale = 1.0f; int depth_tri = 0;
+    if (vk_depth_on()) {     /* what qualifies, once in 600 flips */
+        static unsigned n_all, n_semi, n_noq, n_noscale, n_near, next;
+        static float zmin = 1e9f, zmax;
+        n_all++;
+        if (semi >= 0) n_semi++;
+        else if (!s_pq_valid) n_noq++;
+        else if (!(s_pq_scale > 0.0f)) n_noscale++;
+        else {
+            float z = 1.0f / (s_pq[0] * s_pq_scale);
+            if (z < zmin) zmin = z;
+            if (z > zmax) zmax = z;
+            if (z < vk_depth_near()) n_near++;
+        }
+        if (s_flip_count >= next) {
+            next = s_flip_count + 600u;
+            fprintf(stdout, "psxrecomp: vulkan: depth sorting: textured %u, see-through %u, no weights %u, no scale %u, "
+                    "nearer than %.0f %u; camera depth %.0f to %.0f\n", n_all, n_semi, n_noq, n_noscale,
+                    vk_depth_near(), n_near, zmin, zmax);
+            fflush(stdout);
+            n_all = n_semi = n_noq = n_noscale = n_near = 0; zmin = 1e9f; zmax = 0.0f;
+        }
+    }
+    if (semi < 0 && s_pq_valid && s_pq_scale > 0.0f && vk_depth_on()) {
+        const float lim_q = 1.0f / vk_depth_near();
+        if (s_pq[0] * s_pq_scale <= lim_q && s_pq[1] * s_pq_scale <= lim_q && s_pq[2] * s_pq_scale <= lim_q) {
+            static unsigned order_flip, order;
+            if (order_flip != s_flip_count) { order_flip = s_flip_count; order = 0; }
+            q_scale = s_pq_scale * (1.0f + 0.02f * (float)(order < 8192u ? order : 8192u) / 8192.0f);
+            order++; depth_tri = 1;
+        }
+    }
+    if (s_tcount > 0 && depth_tri != s_tb_depth) flush_tex_batch();
     if (s_tcount > 0 &&
         (isolate || gate != s_tb_gate || hd_ds != s_tb_hd_ds || semi != s_tb_semi || s_mask_set != s_tb_mask || s_mask_check != s_tb_check ||
          texfilter != s_tb_filter ||
@@ -4435,7 +4569,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     }
     if (s_tcount == 0) {
         s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_check = s_mask_check; s_tb_filter = texfilter;
-        s_tb_gate = gate; s_tb_hd_ds = hd_ds;
+        s_tb_gate = gate; s_tb_hd_ds = hd_ds; s_tb_depth = depth_tri;
         s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
     }
     int bx0 = xs[0], bx1 = xs[0], by0 = ys[0], by1 = ys[0];
@@ -4451,7 +4585,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
         vp[12] = (float)depth;   vp[13] = (float)rawtex;
         vp[14] = (float)lim[0];  vp[15] = (float)lim[1];
         vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
-        vp[18] = s_pq_valid ? s_pq[i] : 0.0f;   /* a_q; 0 = affine */
+        vp[18] = s_pq_valid ? s_pq[i] * q_scale : 0.0f;   /* a_q; 0 = affine */
         vp[19] = hd_src[0]; vp[20] = hd_src[1]; vp[21] = hd_src[2]; vp[22] = hd_src[3];
         vp[23] = (float)hd_mode;
         if (xs[i] < bx0) bx0 = xs[i]; if (xs[i] > bx1) bx1 = xs[i];
@@ -5044,6 +5178,7 @@ static void fg_emit(const FgCmd *c, const FgCmd *p, int bd_still) {
     }
     if (nv == 3) {
         s_pq_valid = c->pq_valid;
+        s_pq_scale = c->pq_valid && c->pq[0] > 0.0f && c->iz[0] > 0.0f ? c->iz[0] / c->pq[0] : 0.0f;
         for (int i = 0; i < 3; i++) {
             const int xi = kFgPos[op].xi[i], yi = kFgPos[op].yi[i];
             s_pq[i] = c->pq[i];

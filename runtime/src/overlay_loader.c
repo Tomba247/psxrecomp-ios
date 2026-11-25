@@ -1,3 +1,4 @@
+#include "psx_big.h"
 #include "overlay_loader.h"
 #include "overlay_api.h"
 #include "overlay_path_canon.h"
@@ -4582,7 +4583,7 @@ typedef struct {
     uint32_t out_regs[34];   /* r0..r31, hi, lo at exit                        */
 } FpEnt;
 #define FP_CAP (1u << 16)   /* ~19 MB with full reg files; ~65K executions     */
-static FpEnt    s_fp[FP_CAP];
+PSX_BIG(static, FpEnt, s_fp, FP_CAP)
 static uint64_t s_fp_seq = 0;
 
 int overlay_loader_is_candidate(uint32_t phys) {

@@ -1519,6 +1519,14 @@ static WsAspectConeState *ws_aspect_cone_object_state(uint32_t site,
     return oldest;
 }
 
+/* A title that moved a queue into larger memory says so here (0: back to the
+ * configured capacity), so the guard reserve follows the real size. */
+static uint32_t ws_aspect_cone_queue_live_capacity[3];
+void gpu_ws_set_aspect_cone_queue_live_capacity(int queue, uint32_t capacity) {
+    if (queue >= 0 && queue < 3)
+        ws_aspect_cone_queue_live_capacity[queue] = capacity;
+}
+
 static int ws_aspect_cone_queue_has_guard_room(uint32_t object) {
     if (object == 0) return 0;
     const uint8_t type =
@@ -1527,7 +1535,9 @@ static int ws_aspect_cone_queue_has_guard_room(uint32_t object) {
     const uint32_t bit = 1u << type;
     for (int i = 0; i < 3; i++) {
         if ((ws_aspect_cone_queue_type_masks[i] & bit) == 0) continue;
-        const uint32_t cap = ws_aspect_cone_queue_capacities[i];
+        const uint32_t cap = ws_aspect_cone_queue_live_capacity[i]
+                                 ? ws_aspect_cone_queue_live_capacity[i]
+                                 : ws_aspect_cone_queue_capacities[i];
         const uint32_t reserve = ws_aspect_cone_queue_reserve;
         if (cap == 0 || ws_aspect_cone_queue_count_addrs[i] == 0)
             return 1;

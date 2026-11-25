@@ -6,6 +6,7 @@
  * PSX_DISABLE_AUDIO_PCM_HISTORY is a build-only overhead control; neither
  * recording nor export requires a client to have been attached.
  */
+#include "psx_big.h"
 #include "audio_trace.h"
 
 #include <stdatomic.h>
@@ -36,7 +37,7 @@ typedef struct {
     int32_t          peak;
 } PcmTap;
 
-static PcmTap s_taps[AUDIO_TAP_COUNT];
+PSX_BIG(static, PcmTap, s_taps, AUDIO_TAP_COUNT)
 
 /* Per-tap sample rate for WAV headers. SPU-side taps are natively 44100;
  * the host tap follows the device rate in bridge/pull mode. */
@@ -54,7 +55,7 @@ uint32_t audio_trace_tap_rate(int tap)
     return s_tap_rate[tap];
 }
 
-static AudioTraceEvent  s_events[EV_RING_CAP];
+PSX_BIG(static, AudioTraceEvent, s_events, EV_RING_CAP)
 static _Atomic uint64_t s_event_head;
 
 static _Atomic uint32_t s_noted_frame;

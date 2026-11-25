@@ -46,7 +46,7 @@ typedef struct {
     uint32_t sp;        /* cpu->gpr[29] — for func_8001A954 SP/RA-lifecycle oracle */
 } FntraceEntry;
 
-extern FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
+extern FntraceEntry *g_fntrace_ring; /* FNTRACE_RING_CAP entries */
 extern uint64_t     g_fntrace_seq;     /* monotonic; index into ring = seq % CAP */
 
 /* ── Stack-domain transition ring (ALWAYS-ON, every build) ──────────────────

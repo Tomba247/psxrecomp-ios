@@ -24,6 +24,7 @@
  * 512K entries x 40 bytes = 20 MB; at the default period that is about 63
  * guest seconds of history. Query with the gcp_ring debug command. */
 
+#include "psx_big.h"
 #include "guest_cycle_profile.h"
 #include "psx_bss.h"
 #include "psx_cycles.h"
@@ -46,7 +47,7 @@ extern void (*psx_cycle_sample_hook)(uint64_t cycle, uint32_t periods);
 
 #define GCP_CAP (1u << 19)
 
-static PSX_BSS GcpSample s_gcp[GCP_CAP];
+PSX_BIG(static, GcpSample, s_gcp, GCP_CAP)
 static uint64_t s_gcp_total = 0;
 
 static void gcp_record(uint64_t cycle, uint32_t periods)

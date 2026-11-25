@@ -1,5 +1,6 @@
 /* fntrace.c — runtime side of psx_dispatch call ring. See fntrace.h. */
 
+#include "psx_big.h"
 #include "fntrace.h"
 #include "psx_bss.h"
 #include "text_xlate.h"     /* on-the-fly string translation hook (framework) */
@@ -19,7 +20,7 @@ uint32_t parity_host_frame(void) { extern uint64_t s_frame_count; return (uint32
 uint64_t parity_host_cycle(void) { extern uint64_t psx_get_cycle_count(void); return psx_get_cycle_count(); }
 
 /* Explicit .bss: without this, MinGW+LTO can emit ~144MiB of zeros into .rdata. */
-PSX_BSS FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
+PSX_BIG(, FntraceEntry, g_fntrace_ring, FNTRACE_RING_CAP)
 uint64_t             g_fntrace_seq = 0;
 
 /* Frame counter shared with debug_server.c / dirty_ram_interp.c. */

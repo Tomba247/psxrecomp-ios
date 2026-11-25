@@ -12,6 +12,7 @@
  *   - IRQ delivery via i_stat bit-set (same as timers/dma)
  */
 
+#include "psx_big.h"
 #include "sio.h"
 #include "digital_pad_snapshot.h"
 #include "psx_cycle_freeze.h"
@@ -559,7 +560,7 @@ static int sio_tx_gated = 0;        /* writes gated by missing TX_EN */
 static uint16_t sio_last_ctrl_on_tx = 0; /* CTRL at last TX write */
 
 /* ---- SIO byte-level trace ring buffer ---- */
-static PSX_BSS SioTraceEntry sio_trace_buf[SIO_TRACE_CAP];
+PSX_BIG(static, SioTraceEntry, sio_trace_buf, SIO_TRACE_CAP)
 static int sio_trace_idx = 0;       /* next write position */
 static uint32_t sio_trace_seq = 0;  /* monotonic sequence number */
 
@@ -722,7 +723,7 @@ static void sr_record(uint8_t kind, uint8_t tx, uint8_t rx) {
 
 
 /* ---- Card transaction ring buffer ---- */
-static PSX_BSS SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
+PSX_BIG(static, SioTxnEntry, sio_txn_buf, SIO_TXN_CAP)
 static int       sio_txn_idx = 0;        /* next-write slot */
 static uint32_t  sio_txn_seq = 0;        /* monotonic id of next-to-close */
 static int sio_txn_open = 0;
@@ -789,7 +790,7 @@ static void txn_close(uint8_t end_reason, uint8_t terminal_state, uint32_t func)
 }
 
 /* ---- SIO IRQ #7 delivery ring ---- */
-static PSX_BSS SioIrqEntry sio_irq_buf[SIO_IRQ_RING_CAP];
+PSX_BIG(static, SioIrqEntry, sio_irq_buf, SIO_IRQ_RING_CAP)
 static int       sio_irq_idx = 0;
 static uint32_t  sio_irq_seq = 0;
 
