@@ -365,6 +365,7 @@ static int            s_fg_next = 0;       /* next one to show */
 static float          s_fg_t = 0.5f;       /* position of the picture being built, prev -> cur */
 static int            s_fg_120_off = 0;    /* 120 turned itself off (display cannot keep up) */
 static int            s_fg_hold = 0;       /* a generated picture waits for the next present */
+static int            s_fg_ahead = 0;      /* the generated pictures are submitted */
 static uint32_t       s_fg_hold_stamp = 0;
 static void wide_free_all(void);           /* defined with the wide helpers below */
 static void hd_vk_shutdown(void);
@@ -855,6 +856,15 @@ static void flush_work(void) {
     p_vkQueueSubmit(s_queue, 1, &si, VK_NULL_HANDLE);
     s_perf_cur.submits++;
     s_work_cb = VK_NULL_HANDLE;
+}
+
+/* Start the GPU on what is recorded so far, without waiting for it. */
+static void submit_ahead(void) {
+#ifdef PSX_IOS
+    psx_ios_wait_foreground();
+#endif
+    if (s_work_cb) s_work_pending = 1;
+    flush_work();
 }
 
 /* Defer a staging buffer's destruction until the queue is next idle (its
@@ -2707,10 +2717,39 @@ static void seq_dump(int i, int disp_y, int disp_h) {
     left--;
 }
 
+/* A generated picture was handed to the GPU at the flip, and only the flip
+ * draws into its surface. Everything recorded since is the next frame: the
+ * game draws it right after the flip. Showing the picture must not wait for
+ * that, or it comes out late by the time the GPU takes for a whole frame while
+ * the real picture after it comes out on time, and motion stutters although
+ * every picture is there. So the next frame is submitted behind it. */
+static int fg_is_ahead(int surf) {
+    if (s_fg_ahead)
+        for (int k = 0; k < s_fg_n; k++) if (s_fg_surfs[k] == surf) return 1;
+    return 0;
+}
+static int present_wide_now(int i, int disp_y, int disp_h, int linear);
 static int present_wide_surf(int i, int disp_y, int disp_h, int linear) {
-    flush_cpu_upload();
-    flush_tex_batch(); flush_geometry(); gpu_sync();
+    const int ahead = fg_is_ahead(i);
+    if (ahead) {
+        /* The last present has to be done with the overlays' buffers. */
+        const uint64_t wait_start = SDL_GetPerformanceCounter();
+        p_vkQueueWaitIdle(s_queue);
+        s_perf_cur.wait_us += perf_elapsed_us(wait_start);
+    } else {
+        flush_cpu_upload();
+        flush_tex_batch(); flush_geometry(); gpu_sync();
+    }
     seq_dump(i, disp_y, disp_h);
+    const int shown = present_wide_now(i, disp_y, disp_h, linear);
+    if (ahead) {
+        flush_cpu_upload();
+        flush_tex_batch(); flush_geometry();
+        submit_ahead();
+    }
+    return shown;
+}
+static int present_wide_now(int i, int disp_y, int disp_h, int linear) {
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
     if (!acquire_present(&sc, &cb, &idx, &fr)) return 1;  /* frame skipped/recreated */
 
@@ -3485,7 +3524,7 @@ static void wide_free_all(void) {
         s_wide_base[i] = -1;
     }
     s_wide_cur = -1;
-    s_fg_surf = -1; s_fg_hold = 0; s_fg_n = 0;
+    s_fg_surf = -1; s_fg_hold = 0; s_fg_ahead = 0; s_fg_n = 0;
     s_fg_surfs[0] = s_fg_surfs[1] = s_fg_surfs[2] = -1;
     s_fgq_n = s_fgq_i = 0;
 }
@@ -4792,7 +4831,7 @@ static void fg_reset(void) {
         s_fg_list[i].n = s_fg_list[i].prims = s_fg_list[i].wide_prims = 0;
         s_fg_list[i].overflow = 0;
     }
-    s_fg_hold = 0;
+    s_fg_hold = 0; s_fg_ahead = 0;
     s_fg_flow_last.ok = 0;
 }
 
@@ -5141,7 +5180,7 @@ void vk_renderer_display_flip(void) {
     FgList *cur = &s_fg_list[s_fg_cur], *prev = &s_fg_list[s_fg_cur ^ 1];
     if (cur->n == 0) return;                      /* nothing drawn: not a frame boundary */
     s_fg_stat_flips++;
-    s_fg_hold = 0;
+    s_fg_hold = 0; s_fg_ahead = 0;
     if (s_wide_w > 0 && !cur->overflow && !prev->overflow &&
         cur->wide_prims >= 24 && prev->wide_prims >= 24) {
         int matched = fg_solve(prev, cur);
@@ -5161,7 +5200,9 @@ void vk_renderer_display_flip(void) {
             s_fg_hold = 1;
             s_fg_hold_stamp = s_present_idx;
             s_fg_stat_made++;
+            s_fg_ahead = 1;
         }
+        if (made) submit_ahead();
         fg_csv(cur, matched, made == want);
     }
     if (s_fg_stat_flips >= 300) {

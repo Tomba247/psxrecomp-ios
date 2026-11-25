@@ -610,6 +610,71 @@ static int fg_flow_accept(FgList *prev, FgList *cur, const FgFlow *f, int loose)
     return made;
 }
 
+/* ---- look-alikes ---------------------------------------------------------- */
+/* Two identical objects side by side, and one of them changes its look (a
+ * darker palette, a coarser model) or leaves the picture: for that frame the
+ * other one is the only partner in reach, and the object would be drawn half
+ * way across to it. What gives the mistake away is the sudden motion: real
+ * objects move nearly as they did one frame before, the camera's own change of
+ * speed aside, which everything shares. */
+#define FG_JUMP 10.0f            /* px of unexplained change of motion */
+static struct { float dx, dy, spread; int n; } s_fg_accel;
+static int fg_cmp_float(const void *a, const void *b) {
+    const float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+static void fg_mean_motion(const FgCmd *c, float *dx, float *dy) {
+    const int nv = kFgPos[c->op].nv;
+    *dx = *dy = 0.0f;
+    for (int v = 0; v < nv; v++) { *dx += c->vdx[v]; *dy += c->vdy[v]; }
+    *dx /= (float)nv; *dy /= (float)nv;
+}
+/* The change of motion the pairs `at` have in common. */
+static void fg_accel_find(const FgList *prev, const FgList *cur, const int32_t *at, int n) {
+    enum { CAP = 512 };
+    static float ax[CAP], ay[CAP], d[CAP], sx[CAP], sy[CAP];
+    int m = 0;
+    s_fg_accel.n = 0;
+    const int step = n > CAP ? (n + CAP - 1) / CAP : 1;
+    for (int k = 0; k < n && m < CAP; k += step) {
+        const FgCmd *c = &cur->c[at[k]];
+        if (c->next < 0 || c->how != FG_HOW_ANCHOR) continue;
+        const FgCmd *p = &prev->c[c->next];
+        if (!p->moved || p->how >= FG_HOW_CORNER) continue;
+        float nx, ny, ox, oy; fg_mean_motion(c, &nx, &ny); fg_mean_motion(p, &ox, &oy);
+        ax[m] = sx[m] = nx - ox; ay[m] = sy[m] = ny - oy; m++;
+    }
+    if (m < 12) return;                        /* too few to tell */
+    qsort(sx, (size_t)m, sizeof sx[0], fg_cmp_float); qsort(sy, (size_t)m, sizeof sy[0], fg_cmp_float);
+    s_fg_accel.dx = sx[m / 2]; s_fg_accel.dy = sy[m / 2];
+    for (int k = 0; k < m; k++) d[k] = fabsf(ax[k] - s_fg_accel.dx) + fabsf(ay[k] - s_fg_accel.dy);
+    qsort(d, (size_t)m, sizeof d[0], fg_cmp_float);
+    s_fg_accel.spread = d[m / 2];
+    s_fg_accel.n = m;
+}
+/* How far a motion (dx, dy) is from going on as p did; 0 = p's is not known. */
+static float fg_jump(const FgCmd *p, float dx, float dy) {
+    if (!s_fg_accel.n || !p->moved) return 0.0f;
+    float ox, oy; fg_mean_motion(p, &ox, &oy);
+    return fabsf(dx - ox - s_fg_accel.dx) + fabsf(dy - oy - s_fg_accel.dy);
+}
+/* Can c be where p was, (dx, dy) away? */
+static int fg_plausible(const FgCmd *c, const FgCmd *p, const FgFlow *f, float dx, float dy) {
+    const float e = fg_jump(p, dx, dy);
+    if (e <= FG_JUMP) return 1;
+    float ox, oy; fg_mean_motion(p, &ox, &oy);
+    /* A guessed motion says less about the next one. */
+    const float lim = (p->how >= FG_HOW_CORNER ? 2.0f : 1.0f) * FG_JUMP + 3.0f * s_fg_accel.spread + 0.5f * (fabsf(ox) + fabsf(oy));
+    if (e <= lim) return 1;
+    if (!f || !fg_has_depth(c)) return 0;
+    float ex = 0.0f, ey = 0.0f;                /* what the camera does may be as sudden as it likes */
+    for (int v = 0; v < 3; v++) {
+        float x, y, ux, uy; fg_corner(c, v, &x, &y); fg_flow_at(f, x, y, c->iz[v], &ux, &uy);
+        ex += ux / 3.0f; ey += uy / 3.0f;
+    }
+    return fabsf(dx - ex) + fabsf(dy - ey) <= 2.0f + 0.06f * (fabsf(ex) + fabsf(ey));
+}
+
 /* ---- meshes without an anchor -------------------------------------------- */
 static int fg_component(const FgList *cur, int seed, int mark) {   /* unpaired primitives joined by corners */
     int n = 0, top = 0;
@@ -656,7 +721,7 @@ static int fg_score(const FgList *prev, const FgList *cur, const int32_t *m, int
 }
 /* sure: accept only a mesh whose best shift is clearly better than any other,
  * wherever the surroundings move; else the field breaks ties. */
-static void fg_seed_components(FgList *prev, FgList *cur, int loose, int how, int sure) {
+static void fg_seed_components(FgList *prev, FgList *cur, const FgFlow *flow, int loose, int how, int sure) {
     for (int i = 0; i < cur->n; i++) s_fg_comp[i] = 0;
     int mark = 0;
     for (int i = 0; i < cur->n; i++) {
@@ -689,6 +754,8 @@ static void fg_seed_components(FgList *prev, FgList *cur, int loose, int how, in
                 float px, py; fg_centre(p, &px, &py);
                 const float dd = hypotf(cx - px - ex, cy - py - ey) + sd;
                 if (dd > (sure ? FG_REACH : 24.0f + 0.5f * (fabsf(ex) + fabsf(ey)))) continue;
+                /* Both the surroundings and its own last motion speak against it. */
+                if (!sure && dd > 8.0f && !fg_plausible(d, p, flow, cx - px, cy - py)) continue;
                 int at = tn;                             /* the nearest, sorted */
                 while (at > 0 && top[at - 1].d > dd) at--;
                 if (at >= cap) continue;
@@ -699,7 +766,11 @@ static void fg_seed_components(FgList *prev, FgList *cur, int loose, int how, in
             for (int k = 0; k < tn; k++) {
                 float px, py; fg_centre(&prev->c[top[k].j], &px, &py);
                 int of; const int sc = fg_score(prev, cur, mem, n, &f, cx, cy, cx - px, cy - py, loose, &of);
-                const float rank = sure ? (float)sc : (float)sc * (1.0f - (top[k].d > 40.0f ? 40.0f : top[k].d) / 100.0f);
+                /* Ties go to what the surroundings do and, for a little, to what the
+                 * piece itself did; more than that and a mistake would keep itself alive. */
+                const FgCmd *was = &prev->c[top[k].j];
+                const float off = top[k].d + (was->how >= FG_HOW_CORNER ? 0.0f : 0.25f * fg_jump(was, cx - px, cy - py));
+                const float rank = sure ? (float)sc : (float)sc * (1.0f - (off > 60.0f ? 60.0f : off) / 100.0f);
                 const int same = bi >= 0 && fabsf(cx - px - bhx) < 4.0f && fabsf(cy - py - bhy) < 4.0f;
                 if (rank > best) {
                     if (!same) second = best;
@@ -707,12 +778,16 @@ static void fg_seed_components(FgList *prev, FgList *cur, int loose, int how, in
                 } else if (!same && rank > second) second = rank;
             }
         }
-        if (bi < 0 || (sure && (best < 6.0f || bfrac < 0.6f || second > 0.6f * best))) continue;
+        if (bi < 0 || (sure && (best < 6.0f || bfrac < 0.6f || second > 0.6f * best || !fg_plausible(&cur->c[bi], &prev->c[bj], flow, bhx, bhy)))) continue;
         fg_accept(prev, cur, bi, bj, how);
         fg_grow(prev, cur, loose, how);
     }
 }
 
+static void fg_unpair(FgList *prev, FgCmd *c) {
+    prev->c[c->next].used = 0;
+    c->used = 0; c->moved = 0; c->how = FG_HOW_NONE; c->next = -1;
+}
 /* Drop an anchor that contradicts two or more others at its own corners. */
 static void fg_validate_anchors(FgList *prev, FgList *cur, const int32_t *anch, int n) {
     for (int k = 0; k < n; k++) {
@@ -733,7 +808,7 @@ static void fg_validate_anchors(FgList *prev, FgList *cur, const int32_t *anch, 
                 if (mine) good += s_fgv[id].n[m] - 1; else bad += s_fgv[id].n[m];
             }
         }
-        if (bad >= 2 && bad > good) { prev->c[c->next].used = 0; c->used = 0; c->moved = 0; c->how = FG_HOW_NONE; c->next = -1; }
+        if (bad >= 2 && bad > good) fg_unpair(prev, c);
     }
     for (int i = 0; i < s_fgv_n; i++) memset(s_fgv[i].n, 0, sizeof s_fgv[i].n);
     for (int k = 0; k < n; k++) {
@@ -851,28 +926,35 @@ static int fg_solve(FgList *prev, FgList *cur) {
         }
         anch[an++] = i;
     }
+    fg_accel_find(prev, cur, anch, an);
+    for (int k = 0; k < an; k++) {
+        FgCmd *c = &cur->c[anch[k]];
+        if (c->how != FG_HOW_ANCHOR) continue;
+        float dx, dy; fg_mean_motion(c, &dx, &dy);
+        if (!fg_plausible(c, &prev->c[c->next], NULL, dx, dy)) fg_unpair(prev, c);
+    }
     fg_validate_anchors(prev, cur, anch, an);
     const FgFlow flow = fg_flow_find(prev, cur, anch, an);
     s_fg_flow_last = flow;
-    if (flow.ok) {
-        /* An anchor the camera motion contradicts is either a moving object or
-         * a look-alike that came into reach; let its corners decide later. */
-        fg_flow_accept(prev, cur, &flow, 0);
-    }
+    /* A pair has to look alike and lie within 2 px of where the camera motion
+     * puts it, so for pairing a fit that explains a sixth of the picture will
+     * do (chance alone explains a thirtieth). */
+    const FgFlow *const cam = flow.inliers >= 24 && flow.inliers * 6 >= flow.n ? &flow : NULL;
+    if (cam) fg_flow_accept(prev, cur, cam, 0);
     for (int k = 0; k < an; k++) if (cur->c[anch[k]].next >= 0) fg_queue_around(cur, anch[k]);
     fg_grow(prev, cur, 0, FG_HOW_MESH);
     for (int sure = 1; sure >= 0; sure--) {
         fg_sample_all(cur);
-        fg_seed_components(prev, cur, 0, FG_HOW_SEED, sure);
+        fg_seed_components(prev, cur, cam, 0, FG_HOW_SEED, sure);
     }
-    if (flow.ok) fg_flow_accept(prev, cur, &flow, 1);
+    if (cam) fg_flow_accept(prev, cur, cam, 1);
     for (int i = 0; i < cur->n; i++)                      /* scrolled textures */
         if (fg_is_world(&cur->c[i]) && kFgPos[cur->c[i].op].nv == 3 && cur->c[i].next < 0 && fg_is_textured(cur->c[i].op)) {
             fg_try_mesh(prev, cur, i, 1, FG_HOW_LOOSE);
             fg_grow(prev, cur, 1, FG_HOW_LOOSE);
         }
     fg_sample_all(cur);
-    fg_seed_components(prev, cur, 1, FG_HOW_LOOSE, 0);
+    fg_seed_components(prev, cur, cam, 1, FG_HOW_LOOSE, 0);
     fg_sample_all(cur);
 
     /* Rectangles and lines: nearest to where the surroundings say, or unmoved. */

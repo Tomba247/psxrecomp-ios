@@ -13,23 +13,24 @@
 #endif
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 typedef struct { double x, y, z; } V3;
 typedef struct { V3 p; double yaw, pitch; } Cam;
-typedef struct { V3 v[3]; int uv[6], tp, two_sided, group, obj, vid[3]; } Tri;
+typedef struct { V3 v[3]; int uv[6], tp, two_sided, group, obj, vid[3]; double z0; } Tri;
 #define MAXT 12000
 static Tri T[MAXT]; static int tn;
 static int next_vid = 1;
 static unsigned rs = 12345;
 static double rnd(void) { rs = rs * 1664525u + 1013904223u; return (double)(rs >> 8) / 16777216.0; }
 
-enum { WALL, GROUND, ROPE, AWNING, WATER, PILLAR, HERO, PICKUP, HUD, GROUPS };
-static const char *gname[GROUPS] = { "wall", "ground", "rope", "awning", "waterfall", "pillars", "hero", "pickups", "hud" };
+enum { WALL, GROUND, ROPE, AWNING, WATER, PILLAR, HERO, PICKUP, LEVER, HUD, GROUPS };
+static const char *gname[GROUPS] = { "wall", "ground", "rope", "awning", "waterfall", "pillars", "hero", "pickups", "levers", "hud" };
 
 static void quad(V3 a, V3 b, V3 c, V3 d, int va, int vb, int vc, int vd, int u, int v, int w, int h, int tp, int g, int obj, int two) {
     if (tn + 2 > MAXT) return;
-    Tri t1 = { { a, b, c }, { u, v, u + w, v, u, v + h }, tp, two, g, obj, { va, vb, vc } };
-    Tri t2 = { { c, b, d }, { u, v + h, u + w, v, u + w, v + h }, tp, two, g, obj, { vc, vb, vd } };
+    Tri t1 = { { a, b, c }, { u, v, u + w, v, u, v + h }, tp, two, g, obj, { va, vb, vc }, 0 };
+    Tri t2 = { { c, b, d }, { u, v + h, u + w, v, u + w, v + h }, tp, two, g, obj, { vc, vb, vd }, 0 };
     T[tn++] = t1; T[tn++] = t2;
 }
 /* nx * ny quads over a parallelogram; every quad shows the same cut-out when
@@ -65,6 +66,15 @@ static void build(void) {
         sheet(vec(-60 + 25 * (k % 6), 100 + 40 * (k / 6), 1000 - 8 * (k % 3)), vec(26, 0, 0), vec(0, 42, 0), 1, 1, 1, k * 8, 200, 8, 8, 7, HERO, 1, 1);
     for (int k = 0; k < 5; k++)
         sheet(vec(-700 + 300 * k, 300, 1100 + 90 * k), vec(50, 0, 0), vec(0, 50, 0), 2, 2, 1, 0, 220, 16, 16, 8, PICKUP, 2 + k, 1);
+    /* Identical levers one behind the other. Their look follows the distance in
+     * steps (a coarser model, a darker palette), so in the frame a step is
+     * crossed each looks exactly as its neighbour did one frame before. */
+    for (int k = 0; k < 8; k++) {
+        const int from = tn;
+        sheet(vec(-420 + 150 * (k & 1), -260 + 88 * k, 1330 + 100 * k), vec(116, 0, 0), vec(0, 26, 0), 4, 1, 1, 0, 160, 8, 16, 40, LEVER, 0, 1);
+        sheet(vec(-300 + 150 * (k & 1), -300 + 88 * k, 1330 + 100 * k), vec(24, 0, 0), vec(0, 66, 0), 1, 3, 1, 32, 160, 8, 8, 40, LEVER, 0, 1);
+        for (int i = from; i < tn; i++) T[i].z0 = 1330 + 100 * k;
+    }
 }
 
 typedef struct { float x, y; } P2;
@@ -124,7 +134,8 @@ static void render(FgList *l, Meta *m, const Cam *c, double time, int precise, i
     for (int k = 0; k < n; k++) {
         const Tri *t = &T[s[k].t]; P2 q[3]; double d[3];
         for (int v = 0; v < 3; v++) project(animate(t, v, time), c, &q[v], &d[v]);
-        put(l, m, s[k].t, q, d, t->uv, t->tp, precise, buffer, t->group == WATER ? scroll : 0);
+        const int level = t->group == LEVER ? (int)floor((t->z0 - c->p.z) / 100.0) : 0;
+        put(l, m, s[k].t, q, d, t->uv, t->tp + level, precise, buffer, t->group == WATER ? scroll : 0);
     }
     for (int k = 0; k < 8; k++) {                        /* score digits: alike, fixed to the screen */
         const float x = 20.0f + 10.0f * (float)k; const int uv[6] = { 8 * (k % 3), 240, 8 * (k % 3) + 8, 240, 8 * (k % 3), 250 };
@@ -175,7 +186,7 @@ static Stat run(const char *name, Cam step, int precise, int scroll, int frames,
         Cam c1 = { { c0.p.x + step.p.x, c0.p.y + step.p.y, c0.p.z + step.p.z }, c0.yaw + step.yaw, c0.pitch + step.pitch };
         FgList *prev = f & 1 ? &b : &a, *cur = f & 1 ? &a : &b;
         Meta *mp = f & 1 ? metaB : metaA, *mc = f & 1 ? metaA : metaB;
-        render(prev, mp, &c0, f, precise, f & 1, scroll * f);
+        if (!f) render(prev, mp, &c0, f, precise, f & 1, scroll * f);     /* later it is the last `cur`, solved */
         render(cur, mc, &c1, f + 1, precise, !(f & 1), scroll * (f + 1));
         fg_solve(prev, cur);
         measure(cur, mc, &c0, f, &st);
@@ -240,26 +251,32 @@ int main(int argc, char **argv) {
         { "turn and look down",       { { 10, 5, 0 }, 0.04, 0.03 }, 3 },
         { "orbit (strong parallax)",  { { 80, 0, 10 }, -0.035, 0 }, 4 },
         { "rush forward",             { { 5, 0, 70 }, 0.0, 0 }, 4 },
+        { "walk in (looks change)",   { { 2, 0, 26 }, 0.0, 0 }, 4 },
+        { "walk out (looks change)",  { { 2, 1, -26 }, 0.0, 0 }, 4 },
+        { "bob (looks change)",       { { 3, 6, 18 }, 0.002, 0 }, 4 },
     };
     double worst_broken = 0, worst_torn = 0;
-    double flat_broken = 0, flat_torn = 0;
+    double flat_broken = 0, flat_torn = 0, worst_lever = 0;   /* the levers apart from the rest of the scene */
     for (int mode = 0; mode < 3; mode++) {       /* sub-pixel and depth; whole pixels and depth; sub-pixel only */
         with_depth = mode < 2;
         for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++) {
             const Stat s = run(k[i].n, k[i].s, mode != 1, k[i].scroll, 8, verbose);
-            const double b = 100.0 * s.broken / s.prims, t = 100.0 * s.torn / s.corners;
+            const double b = 100.0 * (s.broken - s.gb[LEVER]) / (s.prims - s.gp[LEVER]), t = 100.0 * s.torn / s.corners;
+            const double lv = s.gp[LEVER] ? 100.0 * s.gb[LEVER] / s.gp[LEVER] : 0;
+            if (strstr(k[i].n, "looks change") && lv > worst_lever) worst_lever = lv;
             double *wb = with_depth ? &worst_broken : &flat_broken, *wt = with_depth ? &worst_torn : &flat_torn;
             if (b > *wb) *wb = b;
             if (t > *wt) *wt = t;
         }
     }
-    printf("worst scene: %.2f%% misplaced, %.2f%% torn corners; without depth %.2f%%, %.2f%%\n",
-           worst_broken, worst_torn, flat_broken, flat_torn);
+    printf("worst scene: %.2f%% misplaced, %.2f%% torn corners; without depth %.2f%%, %.2f%%; look-alike levers %.2f%%\n",
+           worst_broken, worst_torn, flat_broken, flat_torn, worst_lever);
 #ifndef FG_BASELINE
     test_backdrop();
     test_projected();
     assert(worst_broken < 2.0);
     assert(worst_torn < 1.0);
+    assert(worst_lever < 5.0);
     printf("Vulkan frame-generation pairing test passed\n");
 #endif
     return 0;
