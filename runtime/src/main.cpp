@@ -22689,7 +22689,11 @@ session_reboot:
         if (g_video_hidpi_window)
             win_flags |= PSX_SDL_WINDOW_HIGH_DENSITY;
     }
+#ifdef PSX_IOS
+    if (g_video_renderer == 2) win_flags |= touch_ui_metal() ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN;
+#else
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
+#endif
 #ifdef PSX_IOS
     /* A phone screen is 3x: without a high-density drawable the swapchain is
      * created at point size (956x440 on a 2868x1320 panel) and scaled up. */

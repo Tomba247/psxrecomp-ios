@@ -50,7 +50,7 @@ int  touch_ui_hd_pack(void) { return 1; }
 #define B_SQUARE 0x8000u
 
 enum { MODE_AUTO = 0, MODE_ALWAYS = 1, MODE_OFF = 2 };
-enum { ROW_SMOOTH = 0, ROW_FPS, ROW_FIT, ROW_RES, ROW_AA, ROW_TEX, ROW_TOUCH, ROW_OPACITY, ROW_CLOSE, ROW_COUNT };
+enum { ROW_SMOOTH = 0, ROW_FPS, ROW_FIT, ROW_RES, ROW_AA, ROW_TEX, ROW_DEPTH, ROW_GFX, ROW_TOUCH, ROW_OPACITY, ROW_CLOSE, ROW_COUNT };
 
 #define MAX_FINGERS 12
 typedef struct { int used; long long id; float x, y; int ui; } Finger;
@@ -72,6 +72,8 @@ static int s_tex = 2;        /* textures: 0 = sharp, 1 = smooth, 2 = HD pack (ap
 static int s_tex_boot = -1;
 static int s_res = 0;        /* internal resolution: 0 = the game default, else 1..6 x */
 static int s_aa = 0, s_aa_boot = -1;   /* MSAA: 0 off, 1 = 2x, 2 = 4x (applies at start) */
+static int s_depth = 0, s_depth_boot = -1;   /* depth sorting (applies at start) */
+static int s_metal = 0, s_metal_boot = -1;   /* graphics: 0 MoltenVK, 1 Metal (applies at start) */
 static int s_res_boot = -1;  /* value this run started with */
 static int s_has_gamepad;
 static uint16_t s_buttons = 0xFFFFu;
@@ -101,6 +103,8 @@ static void cfg_load(void) {
         else if (sscanf(line, "tex_smooth=%d", &v) == 1) s_tex = v != 0;
         else if (sscanf(line, "textures=%d", &v) == 1) s_tex = v < 0 || v > 2 ? 2 : v;
         else if (sscanf(line, "msaa=%d", &v) == 1) s_aa = v < 0 || v > 2 ? 0 : v;
+        else if (sscanf(line, "depth_sort=%d", &v) == 1) s_depth = v != 0;
+        else if (sscanf(line, "metal=%d", &v) == 1) s_metal = v != 0;
         else if (sscanf(line, "resolution=%d", &v) == 1) s_res = v < 0 || v > 8 ? 0 : v;
     }
     fclose(f);
@@ -109,9 +113,23 @@ static void cfg_load(void) {
 static void cfg_save(void) {
     FILE *f = fopen(s_cfg_path, "w");
     if (!f) return;
-    fprintf(f, "show_fps=%d\nfit_screen=%d\ntouch_mode=%d\nopacity=%d\nfps_mode=%d\nresolution=%d\ntextures=%d\nmsaa=%d\n",
-            s_show_fps, s_fit, s_mode, s_opacity, s_smooth, s_res, s_tex, s_aa);
+    fprintf(f, "show_fps=%d\nfit_screen=%d\ntouch_mode=%d\nopacity=%d\nfps_mode=%d\nresolution=%d\ntextures=%d\nmsaa=%d\ndepth_sort=%d\nmetal=%d\n",
+            s_show_fps, s_fit, s_mode, s_opacity, s_smooth, s_res, s_tex, s_aa, s_depth, s_metal);
     fclose(f);
+}
+
+/* Metal that does not get through its first pictures is left off at the next
+ * start: the marker is there while it starts and gone once it has run. */
+static void metal_marker(char *out, size_t n) { snprintf(out, n, "%s.metal-starting", s_cfg_path); }
+static void metal_boot(void) {
+    char m[560]; metal_marker(m, sizeof m);
+    FILE *f = fopen(m, "r");
+    if (f) {
+        fclose(f); remove(m);
+        if (s_metal) { s_metal = 0; cfg_save(); fprintf(stdout, "psxrecomp: metal did not get through its last start: off\n"); }
+    }
+    s_metal_boot = s_metal;
+    if (s_metal_boot && (f = fopen(m, "w"))) { fputs("1\n", f); fclose(f); }
 }
 
 static void ui_init(void) {
@@ -130,6 +148,8 @@ static void ui_init(void) {
     s_res_boot = s_res;
     s_aa_boot = s_aa;
     s_tex_boot = s_tex;
+    s_depth_boot = s_depth;
+    metal_boot();
     s_has_gamepad = SDL_HasGamepad() ? 1 : 0;
     fprintf(stdout, "psxrecomp: touch ui on (fps %d, fit %d, touch mode %d, opacity %d, gamepad %d)\n",
             s_show_fps, s_fit, s_mode, s_opacity, s_has_gamepad);
@@ -144,6 +164,9 @@ int touch_ui_tex_smooth(void) { ui_init(); return s_enabled && s_tex; }
  * scripted desktop runs follow the environment alone). */
 int touch_ui_hd_pack(void) { ui_init(); return s_enabled ? s_tex_boot == 2 : 1; }
 int touch_ui_msaa(void) { ui_init(); return s_enabled ? (s_aa_boot == 2 ? 4 : s_aa_boot == 1 ? 2 : 1) : 1; }
+int touch_ui_depth_sort(void) { ui_init(); return s_enabled && s_depth_boot == 1; }
+int touch_ui_metal(void) { ui_init(); return s_enabled && s_metal_boot == 1; }
+void touch_ui_metal_ran(void) { char m[560]; metal_marker(m, sizeof m); remove(m); }
 int touch_ui_resolution(void) { ui_init(); return s_enabled ? s_res_boot : 0; }
 
 /* ---- layout ------------------------------------------------------------- */
@@ -157,9 +180,9 @@ static float s_nub_x, s_nub_y;   /* nub offset from the base centre, in u */
 #define COG_R   3.4f
 #define PANEL_HW 55.0f
 #define PANEL_Y0 9.0f
-#define ROW_Y0   (PANEL_Y0 + 11.0f)
-#define ROW_STEP 8.4f
-#define ROW_H    7.4f
+#define ROW_Y0   (PANEL_Y0 + 9.0f)
+#define ROW_STEP 7.0f
+#define ROW_H    6.3f
 
 static float wu(void) { return 100.0f * s_aspect; }
 
@@ -241,6 +264,8 @@ static void menu_tap(float x, float y) {
         case ROW_SMOOTH:  s_smooth = (s_smooth + 1) % 4; break;
         case ROW_TEX:     s_tex = (s_tex + 1) % 3; break;
         case ROW_AA:      s_aa = (s_aa + 1) % 3; break;
+        case ROW_DEPTH:   s_depth = !s_depth; break;
+        case ROW_GFX:     s_metal = !s_metal; break;
         case ROW_FPS:     s_show_fps = !s_show_fps; break;
         case ROW_FIT:     s_fit = !s_fit; break;
         case ROW_RES:     s_res = (s_res + 1) % 9; break;
@@ -537,11 +562,14 @@ static void draw_menu(void) {
     static const char *const kTexNew[3] = { "Sharp (restart)", "Smooth (restart)", "HD pack (restart)" };
     static const char *const kAa[3] = { "Off", "MSAA 2x", "MSAA 4x" };
     static const char *const kAaNew[3] = { "Off (restart)", "MSAA 2x (restart)", "MSAA 4x (restart)" };
-    const char *label[ROW_COUNT] = { "Frame rate", "Show FPS", "Fit to screen", "Resolution", "Anti-aliasing", "Textures", "Touch controls",
+    static const char *const kDepth[4] = { "Off", "On", "Off (restart)", "On (restart)" };
+    static const char *const kGfx[4] = { "Vulkan", "Metal", "Vulkan (restart)", "Metal (restart)" };
+    const char *label[ROW_COUNT] = { "Frame rate", "Show FPS", "Fit to screen", "Resolution", "Anti-aliasing", "Textures", "Depth sorting", "Graphics", "Touch controls",
                                      "Button opacity", "Close" };
     const char *value[ROW_COUNT] = { kRate[s_smooth], kOnOff[s_show_fps], kOnOff[s_fit],
                                      s_res == s_res_boot ? kRes[s_res] : kResNew[s_res], s_aa == s_aa_boot ? kAa[s_aa] : kAaNew[s_aa],
-                                     (s_tex == 2) != (s_tex_boot == 2) ? kTexNew[s_tex] : kTex[s_tex], kMode[s_mode],
+                                     (s_tex == 2) != (s_tex_boot == 2) ? kTexNew[s_tex] : kTex[s_tex],
+                                     kDepth[s_depth + (s_depth != s_depth_boot ? 2 : 0)], kGfx[s_metal + (s_metal != s_metal_boot ? 2 : 0)], kMode[s_mode],
                                      kOpac[s_opacity], NULL };
     for (int r = 0; r < ROW_COUNT; r++) {
         const float cy = ROW_Y0 + ROW_STEP * r + ROW_H * 0.5f;
@@ -549,7 +577,7 @@ static void draw_menu(void) {
         if (!value[r]) { text_mid(cx, cy, label[r], sc, 0xFFFFFF, 1.0f); continue; }
         text_at(cx - PANEL_HW + 8.0f, cy, label[r], sc, 0xFFFFFF, 0.95f);
         const int on = (r == ROW_SMOOTH && s_smooth) || (r == ROW_FPS && s_show_fps) || (r == ROW_FIT && s_fit) ||
-                       (r == ROW_TOUCH && s_mode != MODE_OFF) || r == ROW_OPACITY || r == ROW_RES || (r == ROW_TEX && s_tex) || (r == ROW_AA && s_aa);
+                       (r == ROW_TOUCH && s_mode != MODE_OFF) || r == ROW_OPACITY || r == ROW_RES || (r == ROW_TEX && s_tex) || (r == ROW_AA && s_aa) || (r == ROW_DEPTH && s_depth) || (r == ROW_GFX && s_metal);
         text_right(cx + PANEL_HW - 8.0f, cy, value[r], sc, on ? 0xFFD060 : 0xA0A8B0, 1.0f);
     }
 }

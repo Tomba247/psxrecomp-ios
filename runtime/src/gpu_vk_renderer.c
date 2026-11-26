@@ -88,6 +88,11 @@ void vk_renderer_set_display_aspect(int num, int den) {
 /* vkGetInstanceProcAddr comes from SDL; everything else is loaded through it
  * (global/instance scope) or vkGetDeviceProcAddr (device scope). */
 static PFN_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
+/* gpu_metal_layer.m: the same functions directly on Metal (PSX_METAL=1). */
+extern PFN_vkVoidFunction psx_metal_vkGetInstanceProcAddr(VkInstance instance, const char *name);
+extern VkSurfaceKHR psx_metal_surface(void *layer);
+extern void psx_metal_set_depth_shader(int on);
+#include <SDL3/SDL_metal.h>
 static PFN_vkGetDeviceProcAddr   p_vkGetDeviceProcAddr;
 
 #define VK_GLOBAL_FUNCS(X) \
@@ -613,19 +618,26 @@ static VkPipeline       s_pipe_pack;      /* compute */
 #define PIPE_STENCILS 3
 #define PIPE_CMASKS 2
 #define PIPE_CACHE_N (PIPE_PROGS * PIPE_TOPOS * PIPE_BLENDS * PIPE_STENCILS * PIPE_CMASKS)
-static VkPipeline s_pipe_cache[PIPE_CACHE_N * 4];   /* [single-sample | MSAA] x [order | depth] */
+static VkPipeline s_pipe_cache[PIPE_CACHE_N * 6];   /* [single-sample | MSAA] x [order | depth] */
 /* Depth sorting (PSX_VK_DEPTH=1, off by default): opaque textured triangles
  * with a proven camera depth are tested against a reversed depth buffer
  * (1 / camera depth) of the wide picture. Everything else keeps draw order. */
-static int s_pipe_depth;
+static int s_pipe_depth;        /* 0 draw order, 1 colour tested with tolerance, 2 true depth only */
 static int vk_depth_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("PSX_VK_DEPTH"); on = e && *e && *e != '0'; }
+    if (on < 0) { const char *e = getenv("PSX_VK_DEPTH"); on = e && *e ? *e != '0' : touch_ui_depth_sort(); }
     return on;
+}
+/* How much farther than what is there a face may be and still be drawn, as a
+ * fraction of its distance: faces laid on others on purpose need it. */
+static float vk_depth_tol(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) { const char *e = getenv("PSX_VK_DEPTH_TOL"); v = e && *e ? (float)atof(e) : 0.03f; if (v < 0.0f) v = 0.0f; if (v > 0.5f) v = 0.5f; }
+    return v;
 }
 static float vk_depth_near(void) {
     static float v = -1.0f;
-    if (v < 0.0f) { const char *e = getenv("PSX_VK_DEPTH_NEAR"); v = e && *e ? (float)atof(e) : 1024.0f; if (v < 2.0f) v = 2.0f; }
+    if (v < 0.0f) { const char *e = getenv("PSX_VK_DEPTH_NEAR"); v = e && *e ? (float)atof(e) : 64.0f; if (v < 2.0f) v = 2.0f; }
     return v;
 }
 static VkShaderModule s_mod_geo_v, s_mod_geo_f, s_mod_tex_v, s_mod_tex_f, s_mod_blit_v, s_mod_blit_f;
@@ -1031,7 +1043,7 @@ static int create_instance(void) {
 #if defined(PSX_SDL3)
     static const char *const headless_exts[] = { "VK_KHR_surface", "VK_EXT_headless_surface" };
     const char *const *sdl_exts = headless_exts;
-    if (vk_headless_lib()) ext_count = 2;
+    if (vk_headless_lib() || p_vkGetInstanceProcAddr == psx_metal_vkGetInstanceProcAddr) ext_count = 2;
     else sdl_exts = SDL_Vulkan_GetInstanceExtensions(&ext_count);
     if (!sdl_exts)
         return vk_die("SDL_Vulkan_GetInstanceExtensions failed");
@@ -1613,7 +1625,7 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
               * PIPE_CMASKS + cmask;
     const int msp = s_pipe_ms && s_msaa > 1;
     if (msp) key += PIPE_CACHE_N;
-    if (s_pipe_depth) key += 2 * PIPE_CACHE_N;
+    key += s_pipe_depth * 2 * PIPE_CACHE_N;
     if (s_pipe_cache[key]) return s_pipe_cache[key];
 
     VkShaderModule vs, fs; VkPipelineLayout layout;
@@ -1667,6 +1679,12 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
 
     VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     ms.rasterizationSamples = msp ? (VkSampleCountFlagBits)s_msaa : VK_SAMPLE_COUNT_1_BIT;
+    if (s_pipe_depth == 1) {
+        /* Float depth: the constant is in units of 2^(exponent - 23), so it is
+         * relative to the depth. Positive is nearer (reversed). */
+        rs.depthBiasEnable = VK_TRUE;
+        rs.depthBiasConstantFactor = vk_depth_tol() * 8388608.0f;
+    }
 
     /* Blend (PS1 modes). Alpha always replaced so the colour-alpha mask mirror
      * is exact (src ONE / dst ZERO). */
@@ -1710,9 +1728,9 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int c
     else                   { st.compareOp = VK_COMPARE_OP_EQUAL;  st.failOp = VK_STENCIL_OP_KEEP; st.passOp = VK_STENCIL_OP_INVERT;  st.depthFailOp = VK_STENCIL_OP_KEEP; }
     VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     dss.depthTestEnable = s_pipe_depth ? VK_TRUE : VK_FALSE;
-    dss.depthWriteEnable = s_pipe_depth ? VK_TRUE : VK_FALSE;
+    dss.depthWriteEnable = s_pipe_depth == 2 ? VK_TRUE : VK_FALSE;
     dss.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;   /* reversed: nearer is larger */
-    dss.stencilTestEnable = VK_TRUE; dss.front = st; dss.back = st;
+    dss.stencilTestEnable = s_pipe_depth == 2 ? VK_FALSE : VK_TRUE; dss.front = st; dss.back = st;
 
     VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
@@ -1748,7 +1766,16 @@ static inline uint16_t rgba8_to_rgb555(const uint8_t in[4]) {
 
 int vk_renderer_init_context(SDL_Window *win) {
     s_win = win;
-    if (vk_headless_lib()) {
+    const char *metal = getenv("PSX_METAL");
+#ifdef PSX_IOS
+    const int metal_screen = win && touch_ui_metal();
+#else
+    const int metal_screen = 0;
+#endif
+    psx_metal_set_depth_shader(vk_depth_on());
+    if (metal_screen || (metal && *metal == '1' && vk_headless_lib())) {
+        p_vkGetInstanceProcAddr = psx_metal_vkGetInstanceProcAddr;
+    } else if (vk_headless_lib()) {
         void *lib = dlopen(vk_headless_lib(), RTLD_NOW | RTLD_LOCAL);
         if (!lib) return vk_die("headless: cannot load the Vulkan library");
         p_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
@@ -1773,6 +1800,10 @@ int vk_renderer_init_context(SDL_Window *win) {
         VkHeadlessSurfaceCreateInfoEXT hi = { VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
         if (!mk || mk(s_instance, &hi, NULL, &s_surface) != VK_SUCCESS)
             return vk_die("headless surface failed");
+    } else if (metal_screen) {
+        SDL_MetalView view = SDL_Metal_CreateView(s_win);
+        s_surface = view ? psx_metal_surface(SDL_Metal_GetLayer(view)) : VK_NULL_HANDLE;
+        if (!s_surface) return vk_die("no Metal view");
     } else
 #if defined(PSX_SDL3)
     if (!SDL_Vulkan_CreateSurface(s_win, s_instance, NULL, &s_surface))
@@ -1818,7 +1849,7 @@ void vk_renderer_shutdown(void) {
             staging_destroy(s_staging_cache[i].buf, s_staging_cache[i].mem);
     }
     wide_free_all();          /* native-wide surfaces (color + DS + framebuffers) */
-    for (int i = 0; i < PIPE_CACHE_N * 4; i++)
+    for (int i = 0; i < PIPE_CACHE_N * 6; i++)
         if (s_pipe_cache[i]) p_vkDestroyPipeline(s_dev, s_pipe_cache[i], NULL);
     if (s_pipe_pack)   p_vkDestroyPipeline(s_dev, s_pipe_pack, NULL);
     if (s_mod_geo_v)   p_vkDestroyShaderModule(s_dev, s_mod_geo_v, NULL);
@@ -3833,14 +3864,29 @@ static void pass_close(void) {
         p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
         TexPush tp = r->tp;
         if (r->semi < 0) {
-            s_pipe_depth = r->depth;
+            s_pipe_depth = r->depth ? 1 : 0;
             bind_masked(cb, 1, 0, 0, r->check, r->mask);
             tp.semipass = 0;
             p_vkCmdPushConstants(cb, s_pl_tex, TS, 0, sizeof tp, &tp);
             p_vkCmdDraw(cb, r->n, 1, r->base, 0);
-            if (!r->stencil_fix) { s_pipe_depth = 0; continue; }
+            if (r->depth) {
+                if (r->stencil_fix) {
+                    bind_masked_stencil_only(cb, 1, 0, r->check, 1);
+                    tp.semipass = 2;
+                    p_vkCmdPushConstants(cb, s_pl_tex, TS, 0, sizeof tp, &tp);
+                    p_vkCmdDraw(cb, r->n, 1, r->base, 0);
+                }
+                /* The batch keeps its own draw order; then its true depths. */
+                s_pipe_depth = 2;
+                bind_masked_stencil_only(cb, 1, 0, 0, 0);
+                tp.semipass = 0;
+                p_vkCmdPushConstants(cb, s_pl_tex, TS, 0, sizeof tp, &tp);
+                p_vkCmdDraw(cb, r->n, 1, r->base, 0);
+                s_pipe_depth = 0;
+                continue;
+            }
+            if (!r->stencil_fix) continue;
             bind_masked_stencil_only(cb, 1, 0, r->check, 1);
-            s_pipe_depth = 0;
         } else {
             bind_masked(cb, 1, 0, 0, r->check, r->mask);
             tp.semipass = 1;
@@ -4521,9 +4567,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     int isolate = (semi >= 0);
     const int gate = vk_bd_gate(1, 0);
     /* Absolute weights for a depth-sorted triangle: w becomes the camera depth.
-     * One factor for all three corners, so texturing is unchanged. Later
-     * triangles of a frame get up to 2% nearer, so a face drawn on purpose
-     * over a coplanar one still wins. */
+     * One factor for all three corners, so texturing is unchanged. */
     float q_scale = 1.0f; int depth_tri = 0;
     if (vk_depth_on()) {     /* what qualifies, once in 600 flips */
         static unsigned n_all, n_semi, n_noq, n_noscale, n_near, next;
@@ -4550,10 +4594,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     if (semi < 0 && s_pq_valid && s_pq_scale > 0.0f && vk_depth_on()) {
         const float lim_q = 1.0f / vk_depth_near();
         if (s_pq[0] * s_pq_scale <= lim_q && s_pq[1] * s_pq_scale <= lim_q && s_pq[2] * s_pq_scale <= lim_q) {
-            static unsigned order_flip, order;
-            if (order_flip != s_flip_count) { order_flip = s_flip_count; order = 0; }
-            q_scale = s_pq_scale * (1.0f + 0.02f * (float)(order < 8192u ? order : 8192u) / 8192.0f);
-            order++; depth_tri = 1;
+            q_scale = s_pq_scale; depth_tri = 1;
         }
     }
     if (s_tcount > 0 && depth_tri != s_tb_depth) flush_tex_batch();
